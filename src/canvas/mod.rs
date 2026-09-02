@@ -1,6 +1,7 @@
-// 画布层：TinySkia 2D 渲染
-// 第一阶段仅做渲染自检；标注图元（矩形/椭圆/箭头/画笔/马赛克）在第二阶段实现
+// 画布层：图片加载 + TinySkia 2D 渲染
+// 第二阶段：图片加载 → Slint Image；渲染自检仍在 render 模块
 
+pub mod loader;
 pub mod render;
 
-pub use render::render_self_test;
+pub use loader::load_image;

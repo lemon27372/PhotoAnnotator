@@ -20,6 +20,8 @@ slint = "1.13"
 tiny-skia = "0.11"
 # SQLite 持久化（工作区/缩略图/标注层索引）
 rusqlite = { version = "0.37", features = ["bundled"] }
+# 图片解码（裁剪特性控制体积：PNG/JPG/BMP/GIF/WebP，排除 exr/tiff/avif 等重型格式）
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "bmp", "gif", "webp"] }
 
 [build-dependencies]
 # 编译 ui/*.slint 声明文件（build.rs 使用）

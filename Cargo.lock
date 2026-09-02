@@ -3567,6 +3567,7 @@ dependencies = [
 name = "photo_annotator"
 version = "0.1.0"
 dependencies = [
+ "image",
  "rusqlite",
  "slint",
  "slint-build",

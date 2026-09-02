@@ -7,6 +7,8 @@ use tiny_skia::{Color, FillRule, Paint, PathBuilder, Pixmap, Rect, Shader, Trans
 
 /// 渲染一张 320x240 测试图（白色背景 + 强调蓝矩形 + 错误红圆）
 /// 输出到 target/selftest_canvas.png
+/// 注：第一阶段验证用，标注图元开发后此函数将退役；#[allow(dead_code)] 保留为回归工具
+#[allow(dead_code)]
 pub fn render_self_test() -> Result<PathBuf, Box<dyn std::error::Error>> {
     let mut pixmap = Pixmap::new(320, 240).ok_or("创建画布失败")?;
 
