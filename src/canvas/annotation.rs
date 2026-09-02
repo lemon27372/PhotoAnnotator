@@ -160,19 +160,38 @@ impl Annotation {
     }
 }
 
-/// 标注集合（后续撤销/重做、SQLite 持久化都基于此）
+/// 标注集合（仅撤销；重做已按产品决策移除，见 2026-09-01 开发日志）
 #[derive(Default)]
 pub struct AnnotationStore {
     pub items: Vec<Annotation>,
+    /// 撤销快照栈：每次 push 前压入当前状态
+    undo: Vec<Vec<Annotation>>,
 }
 
 impl AnnotationStore {
     pub fn new() -> Self {
-        Self { items: Vec::new() }
+        Self { items: Vec::new(), undo: Vec::new() }
     }
 
+    /// 添加图元：当前状态入撤销栈
     pub fn push(&mut self, a: Annotation) {
+        self.undo.push(self.items.clone());
         self.items.push(a);
+    }
+
+    /// 撤销最近一次添加；无可撤销返回 false
+    pub fn undo(&mut self) -> bool {
+        if let Some(prev) = self.undo.pop() {
+            self.items = prev;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// 清空撤销历史（保存后调用：保存=提交点，不再可撤销）
+    pub fn clear_history(&mut self) {
+        self.undo.clear();
     }
 
     pub fn len(&self) -> usize {

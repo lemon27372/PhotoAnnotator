@@ -54,6 +54,7 @@ export component AppWindow inherits Window {
     callback zoom-out;
     callback reset-view;
     callback tool-changed;
+    callback undo;
     in-out property <length> pointer-x: 0px;
     in-out property <length> pointer-y: 0px;
     callback pointer-down;
@@ -86,6 +87,11 @@ export component AppWindow inherits Window {
             Button {
                 text: "画笔";
                 clicked => { root.active-tool = 4; root.tool-changed(); }
+            }
+            Rectangle { width: 8px; }
+            Button {
+                text: "撤销";
+                clicked => { root.undo(); }
             }
             Rectangle { width: 8px; }
             Button {

@@ -280,6 +280,24 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             app.set_status(SharedString::from(msg));
         });
     }
+    {
+        // 撤销（重做已按产品决策移除）
+        let weak = app.as_weak();
+        let state = state.clone();
+        app.on_undo(move || {
+            let (Some(app), mut st) = (weak.upgrade(), state.borrow_mut()) else {
+                return;
+            };
+            st.interaction = Interaction::None;
+            hide_previews(&app);
+            if st.store.undo() {
+                update_overlay(&app, &st);
+                app.set_status(SharedString::from(format!("已撤销，剩余 {} 个标注", st.store.len())));
+            } else {
+                app.set_status(SharedString::from("没有可撤销的操作"));
+            }
+        });
+    }
 
     // 5. 指针交互回调（按下/拖动/释放，按当前工具分发）
     {
