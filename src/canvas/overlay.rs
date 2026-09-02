@@ -23,6 +23,45 @@ pub fn render_overlay(width: u32, height: u32, store: &AnnotationStore) -> Optio
     Some((width, height, unpremultiply(pixmap.data())))
 }
 
+/// 合成最终结果：把标注绘制到原图（RGBA，不透明）之上 → PNG 字节
+/// background_rgba 为 straight-alpha RGBA 原图数据（长度须为 w*h*4）
+/// 这是导出/保存的统一路径：所见即所得
+pub fn composite_png(
+    width: u32,
+    height: u32,
+    background_rgba: &[u8],
+    store: &AnnotationStore,
+) -> Option<Vec<u8>> {
+    let len = width as usize * height as usize * 4;
+    if len == 0 || background_rgba.len() != len {
+        return None;
+    }
+    let mut pixmap = Pixmap::new(width, height)?;
+    // straight-alpha → premultiplied 逐像素转换（透明像素需处理，不能直接拷贝）
+    {
+        let data = pixmap.data_mut();
+        for (src, dst) in background_rgba.chunks_exact(4).zip(data.chunks_exact_mut(4)) {
+            let a = src[3] as u32;
+            dst[3] = src[3];
+            if a == 0 {
+                dst[0] = 0;
+                dst[1] = 0;
+                dst[2] = 0;
+            } else {
+                dst[0] = ((src[0] as u32 * a) / 255) as u8;
+                dst[1] = ((src[1] as u32 * a) / 255) as u8;
+                dst[2] = ((src[2] as u32 * a) / 255) as u8;
+            }
+        }
+    }
+
+    for a in store.items.iter() {
+        draw_annotation(&mut pixmap, a);
+    }
+
+    pixmap.encode_png().ok()
+}
+
 fn draw_annotation(pixmap: &mut Pixmap, a: &Annotation) {
     match a {
         Annotation::Rect(b) | Annotation::Ellipse(b) => {

@@ -170,6 +170,10 @@ struct AppState {
     interaction: Interaction,
     image_width: u32,
     image_height: u32,
+    /// 当前图片路径（保存时生成 *_annotated.png）
+    image_path: Option<String>,
+    /// 原图 straight-alpha RGBA（合成导出用）
+    image_rgba: Vec<u8>,
 }
 
 impl AppState {
@@ -179,7 +183,22 @@ impl AppState {
             interaction: Interaction::None,
             image_width: 0,
             image_height: 0,
+            image_path: None,
+            image_rgba: Vec::new(),
         }
+    }
+}
+
+/// 保存输出路径：原图同目录 + `_annotated.png`
+fn annotated_save_path(original: Option<&str>) -> String {
+    match original {
+        Some(p) => {
+            let path = std::path::Path::new(p);
+            let stem = path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| "image".into());
+            let dir = path.parent().unwrap_or_else(|| std::path::Path::new("."));
+            dir.join(format!("{stem}_annotated.png")).to_string_lossy().into_owned()
+        }
+        None => "annotated.png".to_string(),
     }
 }
 
@@ -218,12 +237,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 3. 图片：命令行参数加载
     if let Some(path) = std::env::args().nth(1) {
         match canvas::load_image(&path) {
-            Ok((image, w, h)) => {
+            Ok((image, w, h, rgba)) => {
                 app.set_current_image(image);
                 app.set_image_width(w as f32);
                 app.set_image_height(h as f32);
-                state.borrow_mut().image_width = w;
-                state.borrow_mut().image_height = h;
+                let mut st = state.borrow_mut();
+                st.image_width = w;
+                st.image_height = h;
+                st.image_path = Some(path.clone());
+                st.image_rgba = rgba;
+                drop(st);
                 app.set_fit_mode(true); // 默认自适应
                 app.set_status(SharedString::from(format!("已加载: {path} ({w}x{h})")));
                 println!("[canvas] 图片加载成功: {path} {w}x{h}");
@@ -295,6 +318,42 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 app.set_status(SharedString::from(format!("已撤销，剩余 {} 个标注", st.store.len())));
             } else {
                 app.set_status(SharedString::from("没有可撤销的操作"));
+            }
+        });
+    }
+    {
+        // 保存：合成标注到原图 → PNG；保存=提交点，撤销历史清空
+        let weak = app.as_weak();
+        let state = state.clone();
+        app.on_save(move || {
+            let (Some(app), mut st) = (weak.upgrade(), state.borrow_mut()) else {
+                return;
+            };
+            if st.image_width == 0 {
+                app.set_status(SharedString::from("没有可保存的图片"));
+                return;
+            }
+            let Some(png) = canvas::overlay::composite_png(
+                st.image_width,
+                st.image_height,
+                &st.image_rgba,
+                &st.store,
+            ) else {
+                app.set_status(SharedString::from("合成失败"));
+                return;
+            };
+            let out_path = annotated_save_path(st.image_path.as_deref());
+            match std::fs::write(&out_path, png) {
+                Ok(_) => {
+                    st.store.clear_history();
+                    let n = st.store.len();
+                    app.set_status(SharedString::from(format!(
+                        "已保存: {out_path}（{n} 个标注，撤销历史已重置）"
+                    )));
+                }
+                Err(e) => {
+                    app.set_status(SharedString::from(format!("保存失败: {e}")));
+                }
             }
         });
     }
