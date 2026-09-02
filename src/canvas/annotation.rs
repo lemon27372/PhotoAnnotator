@@ -2,18 +2,23 @@
 //
 // 架构约定：所有图元坐标一律使用「图片像素坐标」存储，
 // 与视图缩放/平移无关（见 canvas/view.rs 的换算说明）。
+//
+// 矩形与椭圆共用 BoxShape（外接矩形两点式）——两者数据同构，
+// 仅渲染方式不同（stroke rect path / stroke oval path）
 
-/// 当前激活的画布工具（0=浏览/平移, 1=矩形；后续扩展椭圆/箭头/画笔…）
+/// 当前激活的画布工具（id 与 .slint active-tool 对应）
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Tool {
     Browse = 0,
     Rect = 1,
+    Ellipse = 2,
 }
 
 impl Tool {
     pub fn from_id(id: i32) -> Self {
         match id {
             1 => Tool::Rect,
+            2 => Tool::Ellipse,
             _ => Tool::Browse,
         }
     }
@@ -23,9 +28,9 @@ impl Tool {
 pub const DEFAULT_COLOR: u32 = 0xF44336; // 错误红
 pub const DEFAULT_STROKE_WIDTH: f32 = 3.0; // 图片像素
 
-/// 矩形框标注（两点式，图片像素坐标）
+/// 通用"框形"标注数据：外接矩形两点式（图片像素坐标）+ 样式
 #[derive(Clone, Debug)]
-pub struct RectAnnotation {
+pub struct BoxShape {
     pub x1: f32,
     pub y1: f32,
     pub x2: f32,
@@ -34,29 +39,47 @@ pub struct RectAnnotation {
     pub width: f32, // 描边宽度（图片像素）
 }
 
-/// 统一的标注图元（后续扩展 Ellipse/Arrow/Pen/Text…）
-#[derive(Clone, Debug)]
-pub enum Annotation {
-    Rect(RectAnnotation),
-}
-
-impl Annotation {
-    /// 构造规范化矩形（x1<=x2, y1<=y2），默认红色描边
-    pub fn rect(x1: f32, y1: f32, x2: f32, y2: f32) -> Self {
-        Annotation::Rect(RectAnnotation {
+impl BoxShape {
+    /// 规范化（x1<=x2, y1<=y2），默认红色描边
+    fn normalized(x1: f32, y1: f32, x2: f32, y2: f32) -> Self {
+        Self {
             x1: x1.min(x2),
             y1: y1.min(y2),
             x2: x1.max(x2),
             y2: y1.max(y2),
             color: DEFAULT_COLOR,
             width: DEFAULT_STROKE_WIDTH,
-        })
+        }
     }
 
-    /// 矩形是否有有效面积（零宽/零高视为无效，丢弃）
-    pub fn rect_has_area(&self) -> bool {
+    /// 是否有有效面积（零宽/零高视为无效，丢弃）
+    fn has_area(&self) -> bool {
+        self.x2 - self.x1 > 0.5 && self.y2 - self.y1 > 0.5
+    }
+}
+
+/// 统一的标注图元（后续扩展 Arrow/Pen/Text…）
+#[derive(Clone, Debug)]
+pub enum Annotation {
+    Rect(BoxShape),
+    Ellipse(BoxShape),
+}
+
+impl Annotation {
+    /// 构造规范化矩形（默认红色描边）
+    pub fn rect(x1: f32, y1: f32, x2: f32, y2: f32) -> Self {
+        Annotation::Rect(BoxShape::normalized(x1, y1, x2, y2))
+    }
+
+    /// 构造规范化椭圆（外接矩形两点式，默认红色描边）
+    pub fn ellipse(x1: f32, y1: f32, x2: f32, y2: f32) -> Self {
+        Annotation::Ellipse(BoxShape::normalized(x1, y1, x2, y2))
+    }
+
+    /// 图元是否有有效面积
+    pub fn has_area(&self) -> bool {
         match self {
-            Annotation::Rect(r) => r.x2 - r.x1 > 0.5 && r.y2 - r.y1 > 0.5,
+            Annotation::Rect(b) | Annotation::Ellipse(b) => b.has_area(),
         }
     }
 }

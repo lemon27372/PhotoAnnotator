@@ -25,16 +25,25 @@ pub fn render_overlay(width: u32, height: u32, store: &AnnotationStore) -> Optio
 
 fn draw_annotation(pixmap: &mut Pixmap, a: &Annotation) {
     match a {
-        Annotation::Rect(r) => {
-            let w = r.x2 - r.x1;
-            let h = r.y2 - r.y1;
+        Annotation::Rect(b) | Annotation::Ellipse(b) => {
+            let w = b.x2 - b.x1;
+            let h = b.y2 - b.y1;
             if w <= 0.0 || h <= 0.0 {
                 return;
             }
-            let Some(rect) = Rect::from_xywh(r.x1, r.y1, w, h) else {
+            let Some(rect) = Rect::from_xywh(b.x1, b.y1, w, h) else {
                 return;
             };
-            stroke_path(pixmap, &PathBuilder::from_rect(rect), r.color, r.width);
+            let path = match a {
+                Annotation::Rect(_) => PathBuilder::from_rect(rect),
+                // 椭圆用外接矩形 push_oval
+                Annotation::Ellipse(_) => {
+                    let mut pb = PathBuilder::new();
+                    pb.push_oval(rect);
+                    pb.finish().unwrap_or_else(|| PathBuilder::from_rect(rect))
+                }
+            };
+            stroke_path(pixmap, &path, b.color, b.width);
         }
     }
 }

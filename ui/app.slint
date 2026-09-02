@@ -24,12 +24,16 @@ export component AppWindow inherits Window {
     // 当前工具：0=浏览 1=矩形
     in-out property <int> active-tool: 0;
 
-    // ---- 绘制中预览矩形（图片坐标，Rust 端更新）----
+    // ---- 绘制中预览 ----
+    // 矩形预览（原生 Rectangle，拖动流畅）
     in-out property <bool> preview-visible: false;
     in-out property <length> preview-x: 0px;
     in-out property <length> preview-y: 0px;
     in-out property <length> preview-w: 0px;
     in-out property <length> preview-h: 0px;
+    // 椭圆预览（Path + SVG commands，图片坐标由 Rust 生成）
+    in-out property <bool> preview-ellipse-visible: false;
+    in-out property <string> preview-commands: "";
 
     // ---- 自动适配计算（fit 模式实时跟随视口）----
     property <float> fit-scale: min(min(root.viewport-width / max(root.image-width, 1px), root.viewport-height / max(root.image-height, 1px)), 1.0);
@@ -66,6 +70,10 @@ export component AppWindow inherits Window {
             Button {
                 text: "矩形";
                 clicked => { root.active-tool = 1; root.tool-changed(); }
+            }
+            Button {
+                text: "椭圆";
+                clicked => { root.active-tool = 2; root.tool-changed(); }
             }
             Rectangle { width: 8px; }
             Button {
@@ -110,6 +118,22 @@ export component AppWindow inherits Window {
                 height: root.preview-h * root.disp-scale;
                 border-width: 3px * root.disp-scale;
                 border-color: #F44336;
+            }
+            // 绘制中预览椭圆（Path + SVG commands；viewbox=整图，坐标即图片像素）
+            Path {
+                visible: root.preview-ellipse-visible;
+                x: root.disp-x;
+                y: root.disp-y;
+                width: root.image-width * root.disp-scale;
+                height: root.image-height * root.disp-scale;
+                viewbox-x: 0;
+                viewbox-y: 0;
+                viewbox-width: root.image-width / 1px;
+                viewbox-height: root.image-height / 1px;
+                commands: root.preview-commands;
+                stroke: #F44336;
+                stroke-width: 3px;
+                fill: transparent;
             }
 
             // 手势层

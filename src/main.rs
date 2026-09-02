@@ -1,8 +1,8 @@
-// PhotoAnnotator 入口（第二阶段：图片加载 + 视图交互 + 矩形标注）
+// PhotoAnnotator 入口（第二阶段：图片加载 + 视图交互 + 矩形/椭圆标注）
 //
 // 交互模型：
 //   浏览工具：拖动平移 / 滚轮缩放（锚点=鼠标）；窗口变化自动回自适应
-//   矩形工具：按下拖动绘制（图片坐标），松开加入标注集合并显示在标注层
+//   矩形/椭圆工具：按下拖动绘制（图片坐标），松开加入标注集合并显示在标注层
 //
 // 用法：photo_annotator <图片路径>
 
@@ -68,6 +68,53 @@ fn zoom(app: &AppWindow, factor: f32) {
     app.set_status(SharedString::from(format!("自由 · 缩放 {:.0}%", next.scale * 100.0)));
 }
 
+// ---------- 预览显示 ----------
+
+/// 隐藏所有绘制预览（矩形 Rectangle / 椭圆 Path）
+fn hide_previews(app: &AppWindow) {
+    app.set_preview_visible(false);
+    app.set_preview_ellipse_visible(false);
+}
+
+/// 矩形预览：原生 Rectangle 元素（图片坐标）
+fn show_rect_preview(app: &AppWindow, x1: f32, y1: f32, x2: f32, y2: f32) {
+    let (x, y) = (x1.min(x2), y1.min(y2));
+    app.set_preview_x(x);
+    app.set_preview_y(y);
+    app.set_preview_w(x1.max(x2) - x);
+    app.set_preview_h(y1.max(y2) - y);
+    app.set_preview_visible(true);
+}
+
+/// 椭圆预览：Path 元素 + SVG commands（外接矩形 → 两段弧）
+fn show_ellipse_preview(app: &AppWindow, x1: f32, y1: f32, x2: f32, y2: f32) {
+    let (x, y) = (x1.min(x2), y1.min(y2));
+    let (w, h) = ((x1.max(x2) - x), (y1.max(y2) - y));
+    let (cx, cy, rx, ry) = (x + w / 2.0, y + h / 2.0, w / 2.0, h / 2.0);
+    let cmd = format!(
+        "M {} {} a {} {} 0 1 0 {} 0 a {} {} 0 1 0 {} 0",
+        cx - rx,
+        cy,
+        rx,
+        ry,
+        2.0 * rx,
+        rx,
+        ry,
+        -2.0 * rx
+    );
+    app.set_preview_commands(cmd.into());
+    app.set_preview_ellipse_visible(true);
+}
+
+/// 按当前工具显示对应的预览
+fn show_preview(app: &AppWindow, tool: Tool, x1: f32, y1: f32, x2: f32, y2: f32) {
+    match tool {
+        Tool::Rect => show_rect_preview(app, x1, y1, x2, y2),
+        Tool::Ellipse => show_ellipse_preview(app, x1, y1, x2, y2),
+        Tool::Browse => {}
+    }
+}
+
 // ---------- 应用状态 ----------
 
 /// 当前指针交互（一次按下 → 释放期间）
@@ -75,8 +122,8 @@ enum Interaction {
     None,
     /// 浏览工具下按住拖动 = 平移
     Panning { last: (f32, f32) },
-    /// 矩形工具下按住拖动 = 绘制（起止点均为图片像素坐标）
-    DrawingRect { start: (f32, f32), current: (f32, f32) },
+    /// 绘制工具下按住拖动 = 绘制图元（起止点均为图片像素坐标）
+    DrawingShape { start: (f32, f32), current: (f32, f32) },
 }
 
 struct AppState {
@@ -98,7 +145,6 @@ impl AppState {
 }
 
 /// 重渲染标注层（仅已完成的图元）并推到 Slint
-/// 注意：绘制中预览不经过此函数（走 Slint preview-* 属性），保证拖动流畅
 fn update_overlay(app: &AppWindow, state: &AppState) {
     if let Some((w, h, bytes)) = canvas::overlay::render_overlay(
         state.image_width,
@@ -111,14 +157,13 @@ fn update_overlay(app: &AppWindow, state: &AppState) {
     }
 }
 
-/// 设置预览矩形（图片坐标，自动规范化），并显示
-fn show_preview(app: &AppWindow, x1: f32, y1: f32, x2: f32, y2: f32) {
-    let (x, y) = (x1.min(x2), y1.min(y2));
-    app.set_preview_x(x);
-    app.set_preview_y(y);
-    app.set_preview_w(x1.max(x2) - x);
-    app.set_preview_h(y1.max(y2) - y);
-    app.set_preview_visible(true);
+/// 按工具把两点式绘制结果构造成图元
+fn annotation_from_shape(tool: Tool, x1: f32, y1: f32, x2: f32, y2: f32) -> Annotation {
+    match tool {
+        Tool::Rect => Annotation::rect(x1, y1, x2, y2),
+        Tool::Ellipse => Annotation::ellipse(x1, y1, x2, y2),
+        Tool::Browse => unreachable!("浏览工具不会创建图元"),
+    }
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -176,7 +221,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         });
     }
     {
-        // 工具切换：终止未完成的绘制/平移，并给出状态反馈
+        // 工具切换：终止未完成的绘制/平移，隐藏残留预览，给出状态反馈
         let weak = app.as_weak();
         let state = state.clone();
         app.on_tool_changed(move || {
@@ -184,9 +229,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 return;
             };
             st.interaction = Interaction::None;
+            hide_previews(&app);
             let msg = match Tool::from_id(app.get_active_tool()) {
                 Tool::Browse => "浏览工具：拖动平移 / 滚轮缩放",
                 Tool::Rect => "矩形工具：按住左键拖动画框",
+                Tool::Ellipse => "椭圆工具：按住左键拖动画框",
             };
             app.set_status(SharedString::from(msg));
         });
@@ -209,13 +256,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     st.interaction = Interaction::Panning { last: (cx, cy) };
                     app.set_status(SharedString::from("浏览 · 拖动平移"));
                 }
-                Tool::Rect => {
+                Tool::Rect | Tool::Ellipse => {
                     // 绘制前固化为自由模式，保证坐标换算使用真实视图变换
                     ensure_free(&app);
+                    hide_previews(&app);
                     let (ix, iy) = read_transform(&app).canvas_to_image(cx, cy);
-                    st.interaction = Interaction::DrawingRect { start: (ix, iy), current: (ix, iy) };
-                    app.set_preview_visible(false); // 清除可能的残留预览
-                    app.set_status(SharedString::from("矩形 · 拖动画框"));
+                    st.interaction =
+                        Interaction::DrawingShape { start: (ix, iy), current: (ix, iy) };
+                    app.set_status(SharedString::from("绘制中 · 拖拽成形"));
                 }
             }
         });
@@ -238,11 +286,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     app.set_view_offset_x(app.get_view_offset_x() + dx);
                     app.set_view_offset_y(app.get_view_offset_y() + dy);
                 }
-                Interaction::DrawingRect { start, .. } => {
+                Interaction::DrawingShape { start, .. } => {
                     let (ix, iy) = read_transform(&app).canvas_to_image(cx, cy);
-                    st.interaction = Interaction::DrawingRect { start, current: (ix, iy) };
+                    st.interaction = Interaction::DrawingShape { start, current: (ix, iy) };
                     // 只更新预览元素属性（GPU 原生渲染），不重建标注层位图
-                    show_preview(&app, start.0, start.1, ix, iy);
+                    let tool = Tool::from_id(app.get_active_tool());
+                    show_preview(&app, tool, start.0, start.1, ix, iy);
                 }
                 Interaction::None => {}
             }
@@ -256,16 +305,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 return;
             };
             match std::mem::replace(&mut st.interaction, Interaction::None) {
-                Interaction::DrawingRect { start, current } => {
-                    // 隐藏预览，把完成的矩形并入标注层
-                    app.set_preview_visible(false);
-                    let a = Annotation::rect(start.0, start.1, current.0, current.1);
-                    if a.rect_has_area() {
+                Interaction::DrawingShape { start, current } => {
+                    // 隐藏预览，把完成的图元并入标注层
+                    hide_previews(&app);
+                    let tool = Tool::from_id(app.get_active_tool());
+                    let a = annotation_from_shape(tool, start.0, start.1, current.0, current.1);
+                    if a.has_area() {
                         st.store.push(a);
                         let n = st.store.len();
                         app.set_status(SharedString::from(format!("已添加标注，共 {n} 个")));
                     } else {
-                        app.set_status(SharedString::from("忽略零尺寸矩形"));
+                        app.set_status(SharedString::from("忽略零尺寸图元"));
                     }
                     update_overlay(&app, &st);
                 }
