@@ -1,0 +1,13 @@
+{
+  "recommendations": [
+    "rust-lang.rust-analyzer",
+    "tamasfe.even-better-toml",
+    "slint.slint",
+    "vadimcn.vscode-lldb",
+    "usernamehw.errorlens",
+    "eamodio.gitlens",
+    "qwtel.sqlite-viewer",
+    "serayuzgur.crates",
+    "MS-CEINTL.vscode-language-pack-zh-hans"
+  ]
+}
