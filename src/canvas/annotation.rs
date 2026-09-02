@@ -12,6 +12,7 @@ pub enum Tool {
     Browse = 0,
     Rect = 1,
     Ellipse = 2,
+    Arrow = 3,
 }
 
 impl Tool {
@@ -19,6 +20,7 @@ impl Tool {
         match id {
             1 => Tool::Rect,
             2 => Tool::Ellipse,
+            3 => Tool::Arrow,
             _ => Tool::Browse,
         }
     }
@@ -26,7 +28,8 @@ impl Tool {
 
 /// 默认标注样式（后续支持颜色/粗细调整）
 pub const DEFAULT_COLOR: u32 = 0xF44336; // 错误红
-pub const DEFAULT_STROKE_WIDTH: f32 = 3.0; // 图片像素
+pub const DEFAULT_STROKE_WIDTH: f32 = 3.0; // 框类（矩形/椭圆）线宽，图片像素
+pub const ARROW_STROKE_WIDTH: f32 = 5.0; // 箭头线宽（视觉上应比框粗，图片像素）
 
 /// 通用"框形"标注数据：外接矩形两点式（图片像素坐标）+ 样式
 #[derive(Clone, Debug)]
@@ -58,11 +61,57 @@ impl BoxShape {
     }
 }
 
-/// 统一的标注图元（后续扩展 Arrow/Pen/Text…）
+/// 线段类标注（箭头）：起点→终点（图片像素坐标）+ 样式
+#[derive(Clone, Debug)]
+pub struct LineShape {
+    pub x1: f32,
+    pub y1: f32,
+    pub x2: f32,
+    pub y2: f32,
+    pub color: u32,
+    pub width: f32,
+}
+
+impl LineShape {
+    fn new(x1: f32, y1: f32, x2: f32, y2: f32) -> Self {
+        Self { x1, y1, x2, y2, color: DEFAULT_COLOR, width: ARROW_STROKE_WIDTH }
+    }
+
+    /// 线段长度（图片像素）；过短视为无效
+    fn length(&self) -> f32 {
+        let dx = self.x2 - self.x1;
+        let dy = self.y2 - self.y1;
+        (dx * dx + dy * dy).sqrt()
+    }
+}
+
+/// 箭头头部三角形顶点（按图片像素计算）：[箭尖, 尾左, 尾右]
+/// 头部尺寸随线宽缩放保持协调：长 = 4×线宽，半宽 = 1.6×线宽
+pub fn arrow_head_points(x1: f32, y1: f32, x2: f32, y2: f32, width: f32) -> Option<[(f32, f32); 3]> {
+    let dx = x2 - x1;
+    let dy = y2 - y1;
+    let len = (dx * dx + dy * dy).sqrt();
+    if len < 1.0 {
+        return None;
+    }
+    let (ux, uy) = (dx / len, dy / len); // 单位方向
+    let (bx, by) = (-uy, ux); // 垂直单位向量
+    let head_len = (width * 4.0).max(12.0);
+    let head_half = (width * 1.6).max(5.0);
+    let (bx_, by_) = (x2 - ux * head_len, y2 - uy * head_len); // 尾基线中点
+    Some([
+        (x2, y2),
+        (bx_ + bx * head_half, by_ + by * head_half),
+        (bx_ - bx * head_half, by_ - by * head_half),
+    ])
+}
+
+/// 统一的标注图元（后续扩展 Pen/Text…）
 #[derive(Clone, Debug)]
 pub enum Annotation {
     Rect(BoxShape),
     Ellipse(BoxShape),
+    Arrow(LineShape),
 }
 
 impl Annotation {
@@ -76,10 +125,16 @@ impl Annotation {
         Annotation::Ellipse(BoxShape::normalized(x1, y1, x2, y2))
     }
 
-    /// 图元是否有有效面积
+    /// 构造箭头（起点→终点，默认红色描边）
+    pub fn arrow(x1: f32, y1: f32, x2: f32, y2: f32) -> Self {
+        Annotation::Arrow(LineShape::new(x1, y1, x2, y2))
+    }
+
+    /// 图元是否有有效面积/长度
     pub fn has_area(&self) -> bool {
         match self {
             Annotation::Rect(b) | Annotation::Ellipse(b) => b.has_area(),
+            Annotation::Arrow(l) => l.length() > 2.0,
         }
     }
 }

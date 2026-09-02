@@ -70,10 +70,12 @@ fn zoom(app: &AppWindow, factor: f32) {
 
 // ---------- 预览显示 ----------
 
-/// 隐藏所有绘制预览（矩形 Rectangle / 椭圆 Path）
+use slint::{Brush, Color};
+
+/// 隐藏所有绘制预览（矩形 Rectangle / Path 类）
 fn hide_previews(app: &AppWindow) {
     app.set_preview_visible(false);
-    app.set_preview_ellipse_visible(false);
+    app.set_preview_path_visible(false);
 }
 
 /// 矩形预览：原生 Rectangle 元素（图片坐标）
@@ -86,7 +88,7 @@ fn show_rect_preview(app: &AppWindow, x1: f32, y1: f32, x2: f32, y2: f32) {
     app.set_preview_visible(true);
 }
 
-/// 椭圆预览：Path 元素 + SVG commands（外接矩形 → 两段弧）
+/// 椭圆预览：Path + SVG commands（外接矩形 → 两段弧），仅描边
 fn show_ellipse_preview(app: &AppWindow, x1: f32, y1: f32, x2: f32, y2: f32) {
     let (x, y) = (x1.min(x2), y1.min(y2));
     let (w, h) = ((x1.max(x2) - x), (y1.max(y2) - y));
@@ -103,7 +105,25 @@ fn show_ellipse_preview(app: &AppWindow, x1: f32, y1: f32, x2: f32, y2: f32) {
         -2.0 * rx
     );
     app.set_preview_commands(cmd.into());
-    app.set_preview_ellipse_visible(true);
+    app.set_preview_fill(Brush::SolidColor(Color::from_argb_u8(0, 0, 0, 0))); // 透明：仅描边
+    app.set_preview_stroke_width(3.0);
+    app.set_preview_path_visible(true);
+}
+
+/// 箭头预览：线段 + 实心三角（Path + SVG commands），线宽 5px
+fn show_arrow_preview(app: &AppWindow, x1: f32, y1: f32, x2: f32, y2: f32) {
+    let width = canvas::annotation::ARROW_STROKE_WIDTH;
+    let mut cmd = format!("M {} {} L {} {}", x1, y1, x2, y2);
+    if let Some([tip, left, right]) = canvas::annotation::arrow_head_points(x1, y1, x2, y2, width) {
+        cmd.push_str(&format!(
+            " M {} {} L {} {} L {} {} Z",
+            tip.0, tip.1, left.0, left.1, right.0, right.1
+        ));
+    }
+    app.set_preview_commands(cmd.into());
+    app.set_preview_fill(Brush::SolidColor(Color::from_rgb_u8(0xF4, 0x43, 0x36)));
+    app.set_preview_stroke_width(width);
+    app.set_preview_path_visible(true);
 }
 
 /// 按当前工具显示对应的预览
@@ -111,6 +131,7 @@ fn show_preview(app: &AppWindow, tool: Tool, x1: f32, y1: f32, x2: f32, y2: f32)
     match tool {
         Tool::Rect => show_rect_preview(app, x1, y1, x2, y2),
         Tool::Ellipse => show_ellipse_preview(app, x1, y1, x2, y2),
+        Tool::Arrow => show_arrow_preview(app, x1, y1, x2, y2),
         Tool::Browse => {}
     }
 }
@@ -162,6 +183,7 @@ fn annotation_from_shape(tool: Tool, x1: f32, y1: f32, x2: f32, y2: f32) -> Anno
     match tool {
         Tool::Rect => Annotation::rect(x1, y1, x2, y2),
         Tool::Ellipse => Annotation::ellipse(x1, y1, x2, y2),
+        Tool::Arrow => Annotation::arrow(x1, y1, x2, y2),
         Tool::Browse => unreachable!("浏览工具不会创建图元"),
     }
 }
@@ -234,6 +256,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 Tool::Browse => "浏览工具：拖动平移 / 滚轮缩放",
                 Tool::Rect => "矩形工具：按住左键拖动画框",
                 Tool::Ellipse => "椭圆工具：按住左键拖动画框",
+                Tool::Arrow => "箭头工具：从起点拖到终点",
             };
             app.set_status(SharedString::from(msg));
         });
@@ -256,7 +279,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     st.interaction = Interaction::Panning { last: (cx, cy) };
                     app.set_status(SharedString::from("浏览 · 拖动平移"));
                 }
-                Tool::Rect | Tool::Ellipse => {
+                Tool::Rect | Tool::Ellipse | Tool::Arrow => {
                     // 绘制前固化为自由模式，保证坐标换算使用真实视图变换
                     ensure_free(&app);
                     hide_previews(&app);

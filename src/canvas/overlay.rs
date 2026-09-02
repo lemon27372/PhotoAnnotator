@@ -42,8 +42,41 @@ fn draw_annotation(pixmap: &mut Pixmap, a: &Annotation) {
                     pb.push_oval(rect);
                     pb.finish().unwrap_or_else(|| PathBuilder::from_rect(rect))
                 }
+                Annotation::Arrow(_) => unreachable!(),
             };
             stroke_path(pixmap, &path, b.color, b.width);
+        }
+        Annotation::Arrow(l) => {
+            // 箭头线体
+            let mut pb = PathBuilder::new();
+            pb.move_to(l.x1, l.y1);
+            pb.line_to(l.x2, l.y2);
+            if let Some(path) = pb.finish() {
+                stroke_path(pixmap, &path, l.color, l.width);
+            }
+            // 箭头头部（实心三角）
+            if let Some([tip, left, right]) =
+                super::annotation::arrow_head_points(l.x1, l.y1, l.x2, l.y2, l.width)
+            {
+                let mut pb = PathBuilder::new();
+                pb.move_to(tip.0, tip.1);
+                pb.line_to(left.0, left.1);
+                pb.line_to(right.0, right.1);
+                pb.close();
+                if let Some(path) = pb.finish() {
+                    let paint = Paint {
+                        shader: Shader::SolidColor(color_from_u32(l.color)),
+                        ..Default::default()
+                    };
+                    pixmap.fill_path(
+                        &path,
+                        &paint,
+                        tiny_skia::FillRule::Winding,
+                        Transform::identity(),
+                        None,
+                    );
+                }
+            }
         }
     }
 }
