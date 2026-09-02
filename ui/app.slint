@@ -1,19 +1,60 @@
-// PhotoAnnotator 主窗口（第二阶段：图片显示）
-// 完整布局见 doc/设计规范.md：菜单栏 + 工作目录侧边栏 + 标注画布 + 状态栏
+// PhotoAnnotator 主窗口（第二阶段：图片加载 + 视图交互状态机）
+//
+// 视图模式：
+//   自适应(fit)：图片实时居中适应视口，窗口变化自动跟随（常态）
+//   自由(free) ：手动缩放/平移（拖动图片或 +/− 后进入）
+//   回到自适应：点「重置」或窗口尺寸变化后自动恢复
+import { Button } from "std-widgets.slint";
+
 export component AppWindow inherits Window {
     title: "PhotoAnnotator";
     preferred-width: 1000px;
     preferred-height: 700px;
     background: #F8F9FA;
 
-    // 状态栏文字
+    // ---- 状态（Rust 端读写）----
     in-out property <string> status: "启动中...";
-    // 当前显示的图片（Rust 端设置）
     in property <image> current-image;
+    // 图片原始像素尺寸（Rust 端加载时设置）
+    in-out property <length> image-width: 0px;
+    in-out property <length> image-height: 0px;
+    // 手动模式（自由）变换值
+    in-out property <float> view-scale: 1.0;
+    in-out property <length> view-offset-x: 0px;
+    in-out property <length> view-offset-y: 0px;
+    // true=自适应模式（默认/常态）；false=自由模式
+    in-out property <bool> fit-mode: true;
+
+    // ---- 自动适配计算（fit 模式实时跟随视口）----
+    property <float> fit-scale: min(min(root.viewport-width / max(root.image-width, 1px), root.viewport-height / max(root.image-height, 1px)), 1.0);
+    property <length> fit-x: (root.viewport-width - root.image-width * root.fit-scale) * 0.5;
+    property <length> fit-y: (root.viewport-height - root.image-height * root.fit-scale) * 0.5;
+
+    // ---- 回调（Rust 端响应，无参；坐标经 pointer-x/y 属性传递）----
+    callback zoom-in;
+    callback zoom-out;
+    callback reset-view;
+    // 画布鼠标事件最近一次坐标（画布局部坐标，Rust 端读取）
+    in-out property <length> pointer-x: 0px;
+    in-out property <length> pointer-y: 0px;
+    callback pointer-down;
+    callback pointer-move;
+    callback pointer-up;
 
     VerticalLayout {
-        // 画布区域：占据剩余空间，图片等比缩放适应容器
-        Rectangle {
+        // ---- 视图工具条（缩放走鼠标滚轮，锚点为鼠标位置）----
+        HorizontalLayout {
+            height: 36px;
+            padding-left: 8px;
+            padding-right: 8px;
+            Button {
+                text: "重置";
+                clicked => { root.reset-view(); }
+            }
+        }
+
+        // ---- 画布区域：图片 + 手势捕获 ----
+        canvas-area := Rectangle {
             vertical-stretch: 1;
             background: #FFFFFF;
             border-radius: 6px;
@@ -23,13 +64,48 @@ export component AppWindow inherits Window {
 
             Image {
                 source: root.current-image;
-                image-fit: contain;
-                width: 100%;
-                height: 100%;
+                x: root.fit-mode ? root.fit-x : root.view-offset-x;
+                y: root.fit-mode ? root.fit-y : root.view-offset-y;
+                width: root.image-width * (root.fit-mode ? root.fit-scale : root.view-scale);
+                height: root.image-height * (root.fit-mode ? root.fit-scale : root.view-scale);
+                image-fit: fill;
+            }
+
+            // 手势层：滚轮缩放（锚点=鼠标位置）+ 按下/拖动/释放（拖动进入自由模式）
+            // 坐标取自 TouchArea 的 mouse_x/mouse_y（相对画布局部坐标）
+            touch := TouchArea {
+                scroll-event(event) => {
+                    // 先记录鼠标位置作为缩放锚点
+                    root.pointer-x = touch.mouse_x;
+                    root.pointer-y = touch.mouse_y;
+                    if event.delta_y > 0 {
+                        root.zoom-in();
+                    } else if event.delta_y < 0 {
+                        root.zoom-out();
+                    }
+                    return EventResult.accept;
+                }
+                pointer-event(event) => {
+                    if event.kind == PointerEventKind.down {
+                        root.pointer-x = touch.mouse_x;
+                        root.pointer-y = touch.mouse_y;
+                        root.pointer-down();
+                    } else if event.kind == PointerEventKind.up {
+                        root.pointer-x = touch.mouse_x;
+                        root.pointer-y = touch.mouse_y;
+                        root.pointer-up();
+                    }
+                }
+                // moved 仅在鼠标按下并移动时触发，天然过滤悬停移动
+                moved => {
+                    root.pointer-x = touch.mouse_x;
+                    root.pointer-y = touch.mouse_y;
+                    root.pointer-move();
+                }
             }
         }
 
-        // 状态栏
+        // ---- 状态栏 ----
         HorizontalLayout {
             Rectangle {
                 height: 32px;
@@ -52,4 +128,8 @@ export component AppWindow inherits Window {
             }
         }
     }
+
+    // 视口尺寸同步（alias 到 canvas-area）
+    in-out property <length> viewport-width <=> canvas-area.width;
+    in-out property <length> viewport-height <=> canvas-area.height;
 }
