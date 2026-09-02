@@ -1,18 +1,16 @@
-// PhotoAnnotator 入口（第二阶段：图片加载 + 视图交互状态机）
+// PhotoAnnotator 入口（第二阶段：图片加载 + 视图交互 + 矩形标注）
 //
-// 视图模式：
-//   自适应(fit) —— 默认/常态：图片实时居中适应窗口（resize 自动跟随）
-//   自由(free)  —— 拖动图片或手动缩放后进入；可自由平移/缩放
-//   回到自适应    —— 点「重置」，或窗口尺寸变化后自动恢复
+// 交互模型：
+//   浏览工具：拖动平移 / 滚轮缩放（锚点=鼠标）；窗口变化自动回自适应
+//   矩形工具：按下拖动绘制（图片坐标），松开加入标注集合并显示在标注层
 //
-// 用法：
-//   photo_annotator <图片路径>
+// 用法：photo_annotator <图片路径>
 
 mod canvas;
 mod storage;
 
-use canvas::ViewTransform;
-use slint::{SharedString, Timer, TimerMode};
+use canvas::{Annotation, AnnotationStore, Tool, ViewTransform};
+use slint::{Image, Rgba8Pixel, SharedPixelBuffer, SharedString, Timer, TimerMode};
 use std::cell::RefCell;
 use std::rc::Rc;
 use std::time::Duration;
@@ -46,6 +44,7 @@ fn current_fit(app: &AppWindow) -> ViewTransform {
 }
 
 /// 若处于自适应模式，先固化为自由模式（写入当前 fit 值作为手动基准）
+/// 固化后视图无跳变，坐标换算（read_transform）才可靠
 fn ensure_free(app: &AppWindow) {
     if app.get_fit_mode() {
         write_transform(app, &current_fit(app));
@@ -53,14 +52,12 @@ fn ensure_free(app: &AppWindow) {
     }
 }
 
-/// 进入自适应模式
 fn enter_fit(app: &AppWindow, msg: &str) {
     app.set_fit_mode(true);
     app.set_status(SharedString::from(msg));
 }
 
-/// 手动缩放：以当前鼠标位置（画布坐标）为锚点
-/// factor>1 放大，factor<1 缩小
+/// 滚轮缩放：以当前鼠标位置（画布坐标）为锚点
 fn zoom(app: &AppWindow, factor: f32) {
     ensure_free(app);
     let anchor_x = app.get_pointer_x();
@@ -71,12 +68,57 @@ fn zoom(app: &AppWindow, factor: f32) {
     app.set_status(SharedString::from(format!("自由 · 缩放 {:.0}%", next.scale * 100.0)));
 }
 
-// ---------- 拖动状态（平移） ----------
+// ---------- 应用状态 ----------
 
-struct DragState {
-    active: bool,
-    last_x: f32,
-    last_y: f32,
+/// 当前指针交互（一次按下 → 释放期间）
+enum Interaction {
+    None,
+    /// 浏览工具下按住拖动 = 平移
+    Panning { last: (f32, f32) },
+    /// 矩形工具下按住拖动 = 绘制（起止点均为图片像素坐标）
+    DrawingRect { start: (f32, f32), current: (f32, f32) },
+}
+
+struct AppState {
+    store: AnnotationStore,
+    interaction: Interaction,
+    image_width: u32,
+    image_height: u32,
+}
+
+impl AppState {
+    fn new() -> Self {
+        Self {
+            store: AnnotationStore::new(),
+            interaction: Interaction::None,
+            image_width: 0,
+            image_height: 0,
+        }
+    }
+}
+
+/// 重渲染标注层（仅已完成的图元）并推到 Slint
+/// 注意：绘制中预览不经过此函数（走 Slint preview-* 属性），保证拖动流畅
+fn update_overlay(app: &AppWindow, state: &AppState) {
+    if let Some((w, h, bytes)) = canvas::overlay::render_overlay(
+        state.image_width,
+        state.image_height,
+        &state.store,
+    ) {
+        let mut buffer = SharedPixelBuffer::<Rgba8Pixel>::new(w, h);
+        buffer.make_mut_bytes().copy_from_slice(&bytes);
+        app.set_overlay_image(Image::from_rgba8(buffer));
+    }
+}
+
+/// 设置预览矩形（图片坐标，自动规范化），并显示
+fn show_preview(app: &AppWindow, x1: f32, y1: f32, x2: f32, y2: f32) {
+    let (x, y) = (x1.min(x2), y1.min(y2));
+    app.set_preview_x(x);
+    app.set_preview_y(y);
+    app.set_preview_w(x1.max(x2) - x);
+    app.set_preview_h(y1.max(y2) - y);
+    app.set_preview_visible(true);
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -84,18 +126,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let db = storage::init()?;
     println!("[storage] SQLite 初始化完成: {}", db.display());
 
-    // 2. 窗口：启动 Slint 主窗口
+    // 2. 窗口
     let app = AppWindow::new()?;
+    let state = Rc::new(RefCell::new(AppState::new()));
 
-    // 3. 图片：命令行参数加载（后续接入文件对话框/工作目录）
+    // 3. 图片：命令行参数加载
     if let Some(path) = std::env::args().nth(1) {
         match canvas::load_image(&path) {
             Ok((image, w, h)) => {
                 app.set_current_image(image);
                 app.set_image_width(w as f32);
                 app.set_image_height(h as f32);
-                // 打开图片默认进入自适应模式
-                app.set_fit_mode(true);
+                state.borrow_mut().image_width = w;
+                state.borrow_mut().image_height = h;
+                app.set_fit_mode(true); // 默认自适应
+                app.set_status(SharedString::from(format!("已加载: {path} ({w}x{h})")));
                 println!("[canvas] 图片加载成功: {path} {w}x{h}");
             }
             Err(e) => {
@@ -105,7 +150,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    // 4. 视图工具条回调
+    // 4. 视图回调
     {
         let weak = app.as_weak();
         app.on_zoom_in(move || {
@@ -130,48 +175,101 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         });
     }
-
-    // 5. 画布拖动回调（拖动 → 自由模式平移）
-    let drag = Rc::new(RefCell::new(DragState { active: false, last_x: 0.0, last_y: 0.0 }));
     {
+        // 工具切换：终止未完成的绘制/平移，并给出状态反馈
         let weak = app.as_weak();
-        let drag = drag.clone();
-        app.on_pointer_down(move || {
-            if let Some(app) = weak.upgrade() {
-                ensure_free(&app);
-                let mut d = drag.borrow_mut();
-                d.active = true;
-                d.last_x = app.get_pointer_x();
-                d.last_y = app.get_pointer_y();
-                app.set_status(SharedString::from("自由 · 拖动平移"));
-            }
+        let state = state.clone();
+        app.on_tool_changed(move || {
+            let (Some(app), mut st) = (weak.upgrade(), state.borrow_mut()) else {
+                return;
+            };
+            st.interaction = Interaction::None;
+            let msg = match Tool::from_id(app.get_active_tool()) {
+                Tool::Browse => "浏览工具：拖动平移 / 滚轮缩放",
+                Tool::Rect => "矩形工具：按住左键拖动画框",
+            };
+            app.set_status(SharedString::from(msg));
         });
     }
+
+    // 5. 指针交互回调（按下/拖动/释放，按当前工具分发）
     {
         let weak = app.as_weak();
-        let drag = drag.clone();
-        app.on_pointer_move(move || {
-            if let Some(app) = weak.upgrade() {
-                let mut d = drag.borrow_mut();
-                if d.active {
-                    let x = app.get_pointer_x();
-                    let y = app.get_pointer_y();
-                    let dx = x - d.last_x;
-                    let dy = y - d.last_y;
-                    d.last_x = x;
-                    d.last_y = y;
-                    app.set_view_offset_x(app.get_view_offset_x() + dx);
-                    app.set_view_offset_y(app.get_view_offset_y() + dy);
+        let state = state.clone();
+        app.on_pointer_down(move || {
+            let (Some(app), mut st) = (weak.upgrade(), state.borrow_mut()) else {
+                return;
+            };
+            let cx = app.get_pointer_x();
+            let cy = app.get_pointer_y();
+            match Tool::from_id(app.get_active_tool()) {
+                Tool::Browse => {
+                    // 平移需自由模式（视图固定，随鼠标移动）
+                    ensure_free(&app);
+                    st.interaction = Interaction::Panning { last: (cx, cy) };
+                    app.set_status(SharedString::from("浏览 · 拖动平移"));
+                }
+                Tool::Rect => {
+                    // 绘制前固化为自由模式，保证坐标换算使用真实视图变换
+                    ensure_free(&app);
+                    let (ix, iy) = read_transform(&app).canvas_to_image(cx, cy);
+                    st.interaction = Interaction::DrawingRect { start: (ix, iy), current: (ix, iy) };
+                    app.set_preview_visible(false); // 清除可能的残留预览
+                    app.set_status(SharedString::from("矩形 · 拖动画框"));
                 }
             }
         });
     }
     {
         let weak = app.as_weak();
-        let drag = drag.clone();
+        let state = state.clone();
+        app.on_pointer_move(move || {
+            let (Some(app), mut st) = (weak.upgrade(), state.borrow_mut()) else {
+                return;
+            };
+            let cx = app.get_pointer_x();
+            let cy = app.get_pointer_y();
+            match st.interaction {
+                Interaction::Panning { last } => {
+                    let (lx, ly) = last;
+                    let dx = cx - lx;
+                    let dy = cy - ly;
+                    st.interaction = Interaction::Panning { last: (cx, cy) };
+                    app.set_view_offset_x(app.get_view_offset_x() + dx);
+                    app.set_view_offset_y(app.get_view_offset_y() + dy);
+                }
+                Interaction::DrawingRect { start, .. } => {
+                    let (ix, iy) = read_transform(&app).canvas_to_image(cx, cy);
+                    st.interaction = Interaction::DrawingRect { start, current: (ix, iy) };
+                    // 只更新预览元素属性（GPU 原生渲染），不重建标注层位图
+                    show_preview(&app, start.0, start.1, ix, iy);
+                }
+                Interaction::None => {}
+            }
+        });
+    }
+    {
+        let weak = app.as_weak();
+        let state = state.clone();
         app.on_pointer_up(move || {
-            if let Some(_app) = weak.upgrade() {
-                drag.borrow_mut().active = false;
+            let (Some(app), mut st) = (weak.upgrade(), state.borrow_mut()) else {
+                return;
+            };
+            match std::mem::replace(&mut st.interaction, Interaction::None) {
+                Interaction::DrawingRect { start, current } => {
+                    // 隐藏预览，把完成的矩形并入标注层
+                    app.set_preview_visible(false);
+                    let a = Annotation::rect(start.0, start.1, current.0, current.1);
+                    if a.rect_has_area() {
+                        st.store.push(a);
+                        let n = st.store.len();
+                        app.set_status(SharedString::from(format!("已添加标注，共 {n} 个")));
+                    } else {
+                        app.set_status(SharedString::from("忽略零尺寸矩形"));
+                    }
+                    update_overlay(&app, &st);
+                }
+                _ => {}
             }
         });
     }

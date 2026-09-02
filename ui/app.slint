@@ -1,9 +1,5 @@
-// PhotoAnnotator 主窗口（第二阶段：图片加载 + 视图交互状态机）
-//
-// 视图模式：
-//   自适应(fit)：图片实时居中适应视口，窗口变化自动跟随（常态）
-//   自由(free) ：手动缩放/平移（拖动图片或 +/− 后进入）
-//   回到自适应：点「重置」或窗口尺寸变化后自动恢复
+// PhotoAnnotator 主窗口（第二阶段：图片加载 + 视图交互 + 矩形标注）
+// 预览矩形用原生元素实时显示（拖动流畅），完成后并入标注层位图
 import { Button } from "std-widgets.slint";
 
 export component AppWindow inherits Window {
@@ -15,26 +11,41 @@ export component AppWindow inherits Window {
     // ---- 状态（Rust 端读写）----
     in-out property <string> status: "启动中...";
     in property <image> current-image;
-    // 图片原始像素尺寸（Rust 端加载时设置）
+    in property <image> overlay-image; // 标注层（已完成的图元，透明位图）
+    // 图片原始像素尺寸
     in-out property <length> image-width: 0px;
     in-out property <length> image-height: 0px;
     // 手动模式（自由）变换值
     in-out property <float> view-scale: 1.0;
     in-out property <length> view-offset-x: 0px;
     in-out property <length> view-offset-y: 0px;
-    // true=自适应模式（默认/常态）；false=自由模式
+    // true=自适应模式；false=自由模式
     in-out property <bool> fit-mode: true;
+    // 当前工具：0=浏览 1=矩形
+    in-out property <int> active-tool: 0;
+
+    // ---- 绘制中预览矩形（图片坐标，Rust 端更新）----
+    in-out property <bool> preview-visible: false;
+    in-out property <length> preview-x: 0px;
+    in-out property <length> preview-y: 0px;
+    in-out property <length> preview-w: 0px;
+    in-out property <length> preview-h: 0px;
 
     // ---- 自动适配计算（fit 模式实时跟随视口）----
     property <float> fit-scale: min(min(root.viewport-width / max(root.image-width, 1px), root.viewport-height / max(root.image-height, 1px)), 1.0);
     property <length> fit-x: (root.viewport-width - root.image-width * root.fit-scale) * 0.5;
     property <length> fit-y: (root.viewport-height - root.image-height * root.fit-scale) * 0.5;
 
+    // ---- 当前生效的显示变换（fit 与 free 的统一抽象）----
+    property <float> disp-scale: root.fit-mode ? root.fit-scale : root.view-scale;
+    property <length> disp-x: root.fit-mode ? root.fit-x : root.view-offset-x;
+    property <length> disp-y: root.fit-mode ? root.fit-y : root.view-offset-y;
+
     // ---- 回调（Rust 端响应，无参；坐标经 pointer-x/y 属性传递）----
     callback zoom-in;
     callback zoom-out;
     callback reset-view;
-    // 画布鼠标事件最近一次坐标（画布局部坐标，Rust 端读取）
+    callback tool-changed;
     in-out property <length> pointer-x: 0px;
     in-out property <length> pointer-y: 0px;
     callback pointer-down;
@@ -42,18 +53,28 @@ export component AppWindow inherits Window {
     callback pointer-up;
 
     VerticalLayout {
-        // ---- 视图工具条（缩放走鼠标滚轮，锚点为鼠标位置）----
+        // ---- 工具条 ----
         HorizontalLayout {
             height: 36px;
             padding-left: 8px;
             padding-right: 8px;
+            spacing: 4px;
+            Button {
+                text: "浏览";
+                clicked => { root.active-tool = 0; root.tool-changed(); }
+            }
+            Button {
+                text: "矩形";
+                clicked => { root.active-tool = 1; root.tool-changed(); }
+            }
+            Rectangle { width: 8px; }
             Button {
                 text: "重置";
                 clicked => { root.reset-view(); }
             }
         }
 
-        // ---- 画布区域：图片 + 手势捕获 ----
+        // ---- 画布区域：原图 + 标注层 + 预览 + 手势 ----
         canvas-area := Rectangle {
             vertical-stretch: 1;
             background: #FFFFFF;
@@ -62,20 +83,38 @@ export component AppWindow inherits Window {
             border-color: #E0E0E0;
             clip: true;
 
+            // 原图层
             Image {
                 source: root.current-image;
-                x: root.fit-mode ? root.fit-x : root.view-offset-x;
-                y: root.fit-mode ? root.fit-y : root.view-offset-y;
-                width: root.image-width * (root.fit-mode ? root.fit-scale : root.view-scale);
-                height: root.image-height * (root.fit-mode ? root.fit-scale : root.view-scale);
+                x: root.disp-x;
+                y: root.disp-y;
+                width: root.image-width * root.disp-scale;
+                height: root.image-height * root.disp-scale;
                 image-fit: fill;
             }
+            // 标注层（已完成的图元）
+            Image {
+                source: root.overlay-image;
+                x: root.disp-x;
+                y: root.disp-y;
+                width: root.image-width * root.disp-scale;
+                height: root.image-height * root.disp-scale;
+                image-fit: fill;
+            }
+            // 绘制中预览矩形（原生元素，拖动实时跟随；线宽 3px 与标注层一致，随缩放）
+            Rectangle {
+                visible: root.preview-visible;
+                x: root.disp-x + root.preview-x * root.disp-scale;
+                y: root.disp-y + root.preview-y * root.disp-scale;
+                width: root.preview-w * root.disp-scale;
+                height: root.preview-h * root.disp-scale;
+                border-width: 3px * root.disp-scale;
+                border-color: #F44336;
+            }
 
-            // 手势层：滚轮缩放（锚点=鼠标位置）+ 按下/拖动/释放（拖动进入自由模式）
-            // 坐标取自 TouchArea 的 mouse_x/mouse_y（相对画布局部坐标）
+            // 手势层
             touch := TouchArea {
                 scroll-event(event) => {
-                    // 先记录鼠标位置作为缩放锚点
                     root.pointer-x = touch.mouse_x;
                     root.pointer-y = touch.mouse_y;
                     if event.delta_y > 0 {
@@ -85,18 +124,20 @@ export component AppWindow inherits Window {
                     }
                     return EventResult.accept;
                 }
+                // 仅左键触发绘制/平移
                 pointer-event(event) => {
-                    if event.kind == PointerEventKind.down {
-                        root.pointer-x = touch.mouse_x;
-                        root.pointer-y = touch.mouse_y;
-                        root.pointer-down();
-                    } else if event.kind == PointerEventKind.up {
-                        root.pointer-x = touch.mouse_x;
-                        root.pointer-y = touch.mouse_y;
-                        root.pointer-up();
+                    if event.button == PointerEventButton.left {
+                        if event.kind == PointerEventKind.down {
+                            root.pointer-x = touch.mouse_x;
+                            root.pointer-y = touch.mouse_y;
+                            root.pointer-down();
+                        } else if event.kind == PointerEventKind.up {
+                            root.pointer-x = touch.mouse_x;
+                            root.pointer-y = touch.mouse_y;
+                            root.pointer-up();
+                        }
                     }
                 }
-                // moved 仅在鼠标按下并移动时触发，天然过滤悬停移动
                 moved => {
                     root.pointer-x = touch.mouse_x;
                     root.pointer-y = touch.mouse_y;
