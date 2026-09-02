@@ -1,0 +1,44 @@
+// PhotoAnnotator 主窗口（第一阶段最小骨架）
+// 完整布局见 doc/设计规范.md：菜单栏 + 工作目录侧边栏 + 标注画布 + 状态栏
+export component AppWindow inherits Window {
+    title: "PhotoAnnotator";
+    preferred-width: 1000px;
+    preferred-height: 700px;
+    background: #F8F9FA;
+
+    // 状态栏文字（第一阶段验证用，后续接入真实状态）
+    in-out property <string> status: "启动中...";
+
+    VerticalLayout {
+        // 画布区域占位（第一阶段最小验证）
+        Rectangle {
+            background: #FFFFFF;
+            border-radius: 6px;
+            border-width: 1px;
+            border-color: #E0E0E0;
+        }
+
+        // 状态栏
+        HorizontalLayout {
+            Rectangle {
+                height: 32px;
+                background: #FFFFFF;
+                border-radius: 6px;
+                border-width: 1px;
+                border-color: #E0E0E0;
+
+                HorizontalLayout {
+                    padding-left: 12px;
+                    padding-right: 12px;
+                    padding-top: 8px;
+                    padding-bottom: 8px;
+                    Text {
+                        text: root.status;
+                        font-size: 12px;
+                        color: #757575;
+                    }
+                }
+            }
+        }
+    }
+}

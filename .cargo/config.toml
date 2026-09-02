@@ -1,0 +1,7 @@
+# Cargo 国内镜像加速（crates.io → 清华 TUNA）
+# 国内网络直连 crates.io 经常 SSL/超时失败，此配置可显著提速
+[source.crates-io]
+replace-with = "tuna"
+
+[source.tuna]
+registry = "sparse+https://mirrors.tuna.tsinghua.edu.cn/crates.io-index/"

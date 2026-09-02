@@ -1,0 +1,26 @@
+[package]
+name = "photo_annotator"
+version = "0.1.0"
+edition = "2024"
+description = "轻量级桌面图片标注工具：面向测试人员的错误截图标注，以项目/文件夹为单位组织管理"
+license = "MIT"
+
+# 体积红线 < 5MB：启用 LTO + strip 瘦身，panic=abort 减少运行时
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = true
+
+[dependencies]
+# GUI 框架（GPU 渲染，声明式 UI）
+slint = "1.13"
+# 画布 2D 绘图引擎（矩形/椭圆/箭头/画笔/马赛克）
+tiny-skia = "0.11"
+# SQLite 持久化（工作区/缩略图/标注层索引）
+rusqlite = { version = "0.37", features = ["bundled"] }
+
+[build-dependencies]
+# 编译 ui/*.slint 声明文件（build.rs 使用）
+slint-build = "1.13"
