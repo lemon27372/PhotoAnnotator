@@ -13,6 +13,7 @@ pub enum Tool {
     Rect = 1,
     Ellipse = 2,
     Arrow = 3,
+    Pen = 4,
 }
 
 impl Tool {
@@ -21,6 +22,7 @@ impl Tool {
             1 => Tool::Rect,
             2 => Tool::Ellipse,
             3 => Tool::Arrow,
+            4 => Tool::Pen,
             _ => Tool::Browse,
         }
     }
@@ -106,12 +108,21 @@ pub fn arrow_head_points(x1: f32, y1: f32, x2: f32, y2: f32, width: f32) -> Opti
     ])
 }
 
-/// 统一的标注图元（后续扩展 Pen/Text…）
+/// 自由画笔标注：连续折线（图片像素坐标点序列）+ 样式
+#[derive(Clone, Debug)]
+pub struct PenShape {
+    pub points: Vec<(f32, f32)>,
+    pub color: u32,
+    pub width: f32,
+}
+
+/// 统一的标注图元（后续扩展 Text…）
 #[derive(Clone, Debug)]
 pub enum Annotation {
     Rect(BoxShape),
     Ellipse(BoxShape),
     Arrow(LineShape),
+    Pen(PenShape),
 }
 
 impl Annotation {
@@ -130,11 +141,21 @@ impl Annotation {
         Annotation::Arrow(LineShape::new(x1, y1, x2, y2))
     }
 
+    /// 构造自由画笔（折线点序列，默认红色描边）
+    pub fn pen(points: Vec<(f32, f32)>) -> Self {
+        Annotation::Pen(PenShape {
+            points,
+            color: DEFAULT_COLOR,
+            width: DEFAULT_STROKE_WIDTH,
+        })
+    }
+
     /// 图元是否有有效面积/长度
     pub fn has_area(&self) -> bool {
         match self {
             Annotation::Rect(b) | Annotation::Ellipse(b) => b.has_area(),
             Annotation::Arrow(l) => l.length() > 2.0,
+            Annotation::Pen(p) => p.points.len() >= 2,
         }
     }
 }

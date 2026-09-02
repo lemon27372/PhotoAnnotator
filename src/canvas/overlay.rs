@@ -42,17 +42,26 @@ fn draw_annotation(pixmap: &mut Pixmap, a: &Annotation) {
                     pb.push_oval(rect);
                     pb.finish().unwrap_or_else(|| PathBuilder::from_rect(rect))
                 }
-                Annotation::Arrow(_) => unreachable!(),
+                Annotation::Arrow(_) | Annotation::Pen(_) => unreachable!(),
             };
             stroke_path(pixmap, &path, b.color, b.width);
         }
         Annotation::Arrow(l) => {
-            // 箭头线体
+            // 箭头线体：平头(Butt)截止于终点，避免圆头凸出盖过箭尖
             let mut pb = PathBuilder::new();
             pb.move_to(l.x1, l.y1);
             pb.line_to(l.x2, l.y2);
             if let Some(path) = pb.finish() {
-                stroke_path(pixmap, &path, l.color, l.width);
+                let paint = Paint {
+                    shader: Shader::SolidColor(color_from_u32(l.color)),
+                    ..Default::default()
+                };
+                let stroke = Stroke {
+                    width: l.width,
+                    line_cap: LineCap::Butt,
+                    ..Default::default()
+                };
+                pixmap.stroke_path(&path, &paint, &stroke, Transform::identity(), None);
             }
             // 箭头头部（实心三角）
             if let Some([tip, left, right]) =
@@ -76,6 +85,29 @@ fn draw_annotation(pixmap: &mut Pixmap, a: &Annotation) {
                         None,
                     );
                 }
+            }
+        }
+        Annotation::Pen(p) => {
+            // 自由画笔：折线描边（圆头圆角连接，手感平滑）
+            let mut pb = PathBuilder::new();
+            if let Some((x, y)) = p.points.first() {
+                pb.move_to(*x, *y);
+            }
+            for (x, y) in p.points.iter().skip(1) {
+                pb.line_to(*x, *y);
+            }
+            if let Some(path) = pb.finish() {
+                let paint = Paint {
+                    shader: Shader::SolidColor(color_from_u32(p.color)),
+                    ..Default::default()
+                };
+                let stroke = Stroke {
+                    width: p.width,
+                    line_cap: LineCap::Round,
+                    line_join: tiny_skia::LineJoin::Round,
+                    ..Default::default()
+                };
+                pixmap.stroke_path(&path, &paint, &stroke, Transform::identity(), None);
             }
         }
     }

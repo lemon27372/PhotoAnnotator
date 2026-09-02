@@ -83,6 +83,10 @@ export component AppWindow inherits Window {
                 text: "箭头";
                 clicked => { root.active-tool = 3; root.tool-changed(); }
             }
+            Button {
+                text: "画笔";
+                clicked => { root.active-tool = 4; root.tool-changed(); }
+            }
             Rectangle { width: 8px; }
             Button {
                 text: "重置";

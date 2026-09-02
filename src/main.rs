@@ -132,8 +132,24 @@ fn show_preview(app: &AppWindow, tool: Tool, x1: f32, y1: f32, x2: f32, y2: f32)
         Tool::Rect => show_rect_preview(app, x1, y1, x2, y2),
         Tool::Ellipse => show_ellipse_preview(app, x1, y1, x2, y2),
         Tool::Arrow => show_arrow_preview(app, x1, y1, x2, y2),
-        Tool::Browse => {}
+        Tool::Pen | Tool::Browse => {}
     }
+}
+
+/// 画笔预览：折线 Path（仅描边 3px）
+fn show_pen_preview(app: &AppWindow, points: &[(f32, f32)]) {
+    let mut cmd = String::new();
+    for (i, (x, y)) in points.iter().enumerate() {
+        if i == 0 {
+            cmd.push_str(&format!("M {} {}", x, y));
+        } else {
+            cmd.push_str(&format!(" L {} {}", x, y));
+        }
+    }
+    app.set_preview_commands(cmd.into());
+    app.set_preview_fill(Brush::SolidColor(Color::from_argb_u8(0, 0, 0, 0))); // 透明
+    app.set_preview_stroke_width(canvas::annotation::DEFAULT_STROKE_WIDTH);
+    app.set_preview_path_visible(true);
 }
 
 // ---------- 应用状态 ----------
@@ -145,6 +161,8 @@ enum Interaction {
     Panning { last: (f32, f32) },
     /// 绘制工具下按住拖动 = 绘制图元（起止点均为图片像素坐标）
     DrawingShape { start: (f32, f32), current: (f32, f32) },
+    /// 画笔工具：持续累积折线点（图片像素坐标）
+    DrawingPen { points: Vec<(f32, f32)> },
 }
 
 struct AppState {
@@ -184,7 +202,7 @@ fn annotation_from_shape(tool: Tool, x1: f32, y1: f32, x2: f32, y2: f32) -> Anno
         Tool::Rect => Annotation::rect(x1, y1, x2, y2),
         Tool::Ellipse => Annotation::ellipse(x1, y1, x2, y2),
         Tool::Arrow => Annotation::arrow(x1, y1, x2, y2),
-        Tool::Browse => unreachable!("浏览工具不会创建图元"),
+        Tool::Browse | Tool::Pen => unreachable!("浏览/画笔工具不会走两点式创建图元"),
     }
 }
 
@@ -257,6 +275,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 Tool::Rect => "矩形工具：按住左键拖动画框",
                 Tool::Ellipse => "椭圆工具：按住左键拖动画框",
                 Tool::Arrow => "箭头工具：从起点拖到终点",
+                Tool::Pen => "画笔工具：按住左键手绘",
             };
             app.set_status(SharedString::from(msg));
         });
@@ -288,6 +307,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         Interaction::DrawingShape { start: (ix, iy), current: (ix, iy) };
                     app.set_status(SharedString::from("绘制中 · 拖拽成形"));
                 }
+                Tool::Pen => {
+                    ensure_free(&app);
+                    hide_previews(&app);
+                    let (ix, iy) = read_transform(&app).canvas_to_image(cx, cy);
+                    st.interaction = Interaction::DrawingPen {
+                        points: vec![(ix, iy)],
+                    };
+                    app.set_status(SharedString::from("画笔 · 按住手绘"));
+                }
             }
         });
     }
@@ -300,6 +328,26 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             };
             let cx = app.get_pointer_x();
             let cy = app.get_pointer_y();
+            let (ix, iy) = read_transform(&app).canvas_to_image(cx, cy);
+
+            // 画笔：按屏幕位移采样（约 0.5 屏幕像素一点），避免点过密
+            if let Interaction::DrawingPen { points } = &mut st.interaction {
+                let scale = read_transform(&app).scale.max(0.05);
+                let min_d = 0.5 / scale;
+                let append = match points.last() {
+                    Some(last) => {
+                        let d = ((ix - last.0).powi(2) + (iy - last.1).powi(2)).sqrt();
+                        d >= min_d
+                    }
+                    None => true,
+                };
+                if append {
+                    points.push((ix, iy));
+                    show_pen_preview(&app, points);
+                }
+                return;
+            }
+
             match st.interaction {
                 Interaction::Panning { last } => {
                     let (lx, ly) = last;
@@ -310,13 +358,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     app.set_view_offset_y(app.get_view_offset_y() + dy);
                 }
                 Interaction::DrawingShape { start, .. } => {
-                    let (ix, iy) = read_transform(&app).canvas_to_image(cx, cy);
                     st.interaction = Interaction::DrawingShape { start, current: (ix, iy) };
                     // 只更新预览元素属性（GPU 原生渲染），不重建标注层位图
                     let tool = Tool::from_id(app.get_active_tool());
                     show_preview(&app, tool, start.0, start.1, ix, iy);
                 }
-                Interaction::None => {}
+                Interaction::None | Interaction::DrawingPen { .. } => {}
             }
         });
     }
@@ -339,6 +386,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         app.set_status(SharedString::from(format!("已添加标注，共 {n} 个")));
                     } else {
                         app.set_status(SharedString::from("忽略零尺寸图元"));
+                    }
+                    update_overlay(&app, &st);
+                }
+                Interaction::DrawingPen { points } => {
+                    hide_previews(&app);
+                    let a = Annotation::pen(points);
+                    if a.has_area() {
+                        st.store.push(a);
+                        let n = st.store.len();
+                        app.set_status(SharedString::from(format!("已添加标注，共 {n} 个")));
+                    } else {
+                        app.set_status(SharedString::from("忽略过短笔画"));
                     }
                     update_overlay(&app, &st);
                 }
