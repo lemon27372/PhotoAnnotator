@@ -1,0 +1,209 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<title>PhotoAnnotator 极简模式原型</title>
+<style>
+  * { margin:0; padding:0; box-sizing:border-box; }
+  :root {
+    --bg:#F8F9FA; --text:#212121; --sub:#757575;
+    --accent:#4A90D9; --line:#E0E0E0; --err:#F44336;
+  }
+  html,body { height:100%; }
+  body {
+    font-family:"Microsoft YaHei","微软雅黑",sans-serif; color:var(--text);
+    background:var(--bg); display:flex; align-items:center; justify-content:center;
+    overflow:hidden; user-select:none;
+  }
+
+  /* 画布舞台 */
+  .stage { position:relative; width:400px; height:680px; }
+
+  /* 手机截图样例 */
+  .phone {
+    position:absolute; left:50%; top:50%; width:320px; height:600px; transform:translate(-50%,-50%);
+    border-radius:22px; border:5px solid #2B2B2B; background:#fff; overflow:hidden;
+    box-shadow:0 6px 24px rgba(33,33,33,.14);
+  }
+  .p-status { display:flex; justify-content:space-between; padding:7px 14px 4px; font-size:10px; color:#333; }
+  .p-header { text-align:center; font-size:14px; font-weight:600; padding:8px 0 12px; border-bottom:1px solid var(--line); }
+  .p-logo { text-align:center; font-size:42px; margin-top:38px; }
+  .p-appname { text-align:center; font-size:16px; font-weight:700; margin-top:6px; }
+  .p-sub { text-align:center; font-size:11px; color:var(--sub); margin-top:2px; }
+  .p-input {
+    margin:16px 26px 0; border:1px solid var(--line); border-radius:8px; padding:10px 12px;
+    font-size:12px; color:#B9B9B9; background:#FAFAFA;
+  }
+  .p-input.focus { border-color:var(--accent); color:var(--text); background:#fff; }
+  .p-btn {
+    margin:22px 26px 0; border-radius:8px; padding:11px; text-align:center;
+    background:var(--accent); color:#fff; font-size:14px; letter-spacing:6px;
+  }
+  .p-link { text-align:center; font-size:11px; color:var(--accent); margin-top:12px; }
+  .p-toast {
+    position:absolute; left:50%; transform:translateX(-50%); bottom:56px;
+    background:#4A4A4A; color:#fff; font-size:11px; padding:7px 14px; border-radius:6px;
+    white-space:nowrap;
+  }
+  .p-bottom { position:absolute; bottom:0; left:0; right:0; display:flex; border-top:1px solid var(--line); background:#fff; }
+  .p-bottom div { flex:1; text-align:center; font-size:10px; color:var(--sub); padding:7px 0 6px; }
+  .p-bottom div.on { color:var(--accent); }
+
+  /* 标注层 */
+  .anno { position:absolute; inset:0; width:100%; height:100%; pointer-events:none; }
+  .bubble {
+    position:absolute; background:#fff; border:1.5px solid var(--err); color:var(--err);
+    font-size:12px; border-radius:6px; padding:6px 10px; box-shadow:0 2px 8px rgba(244,67,54,.15);
+    white-space:nowrap;
+  }
+  .bubble b { color:var(--err); }
+
+  /* ===== 极简模式浮层 ===== */
+
+  /* 顶部提示（极简模式标识，半透明，可配置隐藏） */
+  .mode-tip {
+    position:fixed; top:18px; right:20px; background:rgba(255,255,255,.85);
+    border:1px solid var(--line); border-radius:6px; padding:5px 12px;
+    font-size:11px; color:var(--sub); box-shadow:0 2px 6px rgba(33,33,33,.06);
+  }
+  .mode-tip b { color:var(--accent); }
+
+  /* 左下角状态浮层 */
+  .status-float {
+    position:fixed; left:24px; bottom:24px; display:flex; align-items:center; gap:10px;
+    background:rgba(255,255,255,.85); border:1px solid var(--line); border-radius:8px;
+    padding:8px 14px; font-size:12px; box-shadow:0 2px 8px rgba(33,33,33,.08);
+  }
+  .status-float .dot { width:8px; height:8px; border-radius:50%; background:var(--accent); }
+  .status-float .fname { font-weight:700; color:var(--text); }
+  .status-float .sep { width:1px; height:12px; background:var(--line); }
+
+  /* 快捷键帮助浮层 */
+  .help {
+    position:fixed; right:140px; top:50%; transform:translateY(-50%);
+    width:470px; background:rgba(33,33,33,.88); border-radius:10px; color:#fff;
+    padding:16px 18px 14px; box-shadow:0 8px 28px rgba(33,33,33,.25);
+    backdrop-filter:blur(2px);
+  }
+  .help .h-title {
+    display:flex; justify-content:space-between; align-items:center;
+    font-size:13px; font-weight:600; margin-bottom:10px;
+  }
+  .help .h-title span { color:rgba(255,255,255,.6); font-weight:400; font-size:11px; }
+  .help .h-row {
+    display:flex; align-items:center; padding:4px 0; font-size:12px;
+    border-top:1px solid rgba(255,255,255,.1);
+  }
+  .help .h-row:first-of-type { border-top:none; }
+  .help .h-cat { width:44px; color:var(--accent); font-weight:600; font-size:11px; flex:0 0 44px; }
+  .help .h-keys { flex:1; display:flex; flex-wrap:wrap; gap:6px 14px; align-items:center; }
+  .help kbd {
+    background:rgba(255,255,255,.12); border:1px solid rgba(255,255,255,.3);
+    border-bottom-width:2px; border-radius:4px; padding:1px 6px;
+    font-family:Consolas,"Microsoft YaHei",monospace; font-size:11px; white-space:nowrap;
+  }
+  .help .h-desc { color:rgba(255,255,255,.72); margin-left:2px; }
+  .help .h-keys .group { display:inline-flex; align-items:center; gap:4px; }
+</style>
+</head>
+<body>
+
+  <!-- 极简模式标识 -->
+  <div class="mode-tip">极简模式 · <b>Ctrl+M</b> 退出</div>
+
+  <!-- 画布舞台（仅图片 + 标注） -->
+  <div class="stage">
+    <div class="phone">
+      <div class="p-status"><span>9:41</span><span>●●●● ▮▮▮ 58%</span></div>
+      <div class="p-header">XX商城</div>
+      <div class="p-logo">🛒</div>
+      <div class="p-appname">XX商城</div>
+      <div class="p-sub">让购物更简单</div>
+      <div class="p-input focus">请输入手机号</div>
+      <div class="p-input">请输入密码</div>
+      <div class="p-btn">登 录</div>
+      <div class="p-link">忘记密码？</div>
+      <div class="p-toast">登录失败，请重试</div>
+      <div class="p-bottom"><div class="on">首页</div><div>分类</div><div>购物车</div><div>我的</div></div>
+    </div>
+
+    <svg class="anno" viewBox="0 0 400 680" fill="none">
+      <defs>
+        <marker id="arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+          <path d="M0 0 L10 5 L0 10 Z" fill="#F44336"/>
+        </marker>
+      </defs>
+      <rect x="148" y="502" width="105" height="28" rx="6" stroke="#F44336" stroke-width="2"/>
+      <path d="M148 516 L90 450" stroke="#F44336" stroke-width="2" marker-end="url(#arr)"/>
+      <path d="M90 450 L60 422" stroke="#F44336" stroke-width="2" marker-end="url(#arr)"/>
+      <circle cx="253" cy="502" r="11" fill="#F44336"/>
+      <text x="253" y="506" text-anchor="middle" font-size="12" fill="#fff" font-weight="700">1</text>
+      <ellipse cx="200" cy="386" rx="86" ry="26" stroke="#FF9800" stroke-width="2" stroke-dasharray="5 4"/>
+      <circle cx="286" cy="360" r="9" fill="#FF9800"/>
+      <text x="286" y="364" text-anchor="middle" font-size="10" fill="#fff" font-weight="700">2</text>
+    </svg>
+
+    <div class="bubble" style="left:12px; top:378px;"><b>问题 1：</b>登录失败但无错误提示</div>
+    <div class="bubble" style="left:170px; top:316px; border-color:#FF9800; color:#E65100;"><b>问题 2：</b>密码框样式异常</div>
+  </div>
+
+  <!-- 左下角状态浮层 -->
+  <div class="status-float">
+    <span class="dot"></span>
+    <span class="fname">2.png</span>
+    <span>登录失败</span>
+    <span class="sep"></span>
+    <span>已标注 <b style="color:var(--accent);">3</b> 处</span>
+    <span class="sep"></span>
+    <span>2 / 15</span>
+  </div>
+
+  <!-- 快捷键帮助浮层（按 H 呼出） -->
+  <div class="help">
+    <div class="h-title">快捷键 <span>(按 H 隐藏 · 5 秒后自动消失)</span></div>
+    <div class="h-row">
+      <div class="h-cat">工具</div>
+      <div class="h-keys">
+        <span class="group"><kbd>R</kbd><span class="h-desc">矩形</span></span>
+        <span class="group"><kbd>O</kbd><span class="h-desc">椭圆</span></span>
+        <span class="group"><kbd>A</kbd><span class="h-desc">箭头</span></span>
+        <span class="group"><kbd>P</kbd><span class="h-desc">画笔</span></span>
+        <span class="group"><kbd>T</kbd><span class="h-desc">文字</span></span>
+        <span class="group"><kbd>M</kbd><span class="h-desc">马赛克</span></span>
+        <span class="group"><kbd>N</kbd><span class="h-desc">序号</span></span>
+      </div>
+    </div>
+    <div class="h-row">
+      <div class="h-cat">编辑</div>
+      <div class="h-keys">
+        <span class="group"><kbd>Ctrl</kbd>+<kbd>Z</kbd><span class="h-desc">撤销</span></span>
+        <span class="group"><kbd>Ctrl</kbd>+<kbd>Y</kbd><span class="h-desc">重做</span></span>
+      </div>
+    </div>
+    <div class="h-row">
+      <div class="h-cat">输出</div>
+      <div class="h-keys">
+        <span class="group"><kbd>Ctrl</kbd>+<kbd>C</kbd><span class="h-desc">复制</span></span>
+        <span class="group"><kbd>Ctrl</kbd>+<kbd>S</kbd><span class="h-desc">保存</span></span>
+      </div>
+    </div>
+    <div class="h-row">
+      <div class="h-cat">导航</div>
+      <div class="h-keys">
+        <span class="group"><kbd>←</kbd><kbd>→</kbd><span class="h-desc">切换图片</span></span>
+        <span class="group"><kbd>H</kbd><span class="h-desc">帮助</span></span>
+        <span class="group"><kbd>Esc</kbd><span class="h-desc">退出</span></span>
+      </div>
+    </div>
+    <div class="h-row">
+      <div class="h-cat">视图</div>
+      <div class="h-keys">
+        <span class="group"><kbd>+</kbd><kbd>-</kbd><span class="h-desc">缩放</span></span>
+        <span class="group"><kbd>0</kbd><span class="h-desc">适应窗口</span></span>
+        <span class="group"><kbd>Space</kbd><span class="h-desc">平移</span></span>
+      </div>
+    </div>
+  </div>
+
+</body>
+</html>

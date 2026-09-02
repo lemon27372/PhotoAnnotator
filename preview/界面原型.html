@@ -1,0 +1,316 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<title>PhotoAnnotator 界面原型</title>
+<style>
+  * { margin:0; padding:0; box-sizing:border-box; }
+  :root {
+    --bg:#FFFFFF; --panel:#F8F9FA; --text:#212121; --sub:#757575;
+    --accent:#4A90D9; --line:#E0E0E0; --ok:#4CAF50; --err:#F44336;
+    --st-done:#4A90D9; --st-pending:#9E9E9E; --st-ignore:#BDBDBD;
+  }
+  html,body { height:100%; }
+  body {
+    font-family:"Microsoft YaHei","微软雅黑",sans-serif; color:var(--text);
+    background:var(--bg); display:flex; flex-direction:column; overflow:hidden;
+    user-select:none;
+  }
+
+  /* ===== 菜单栏 ===== */
+  .menubar {
+    display:flex; align-items:center; gap:20px; padding:7px 16px;
+    border-bottom:1px solid var(--line); font-size:13px; color:var(--text);
+    flex:0 0 auto; background:var(--bg);
+  }
+  .menubar .brand { color:var(--accent); font-weight:700; margin-right:6px; letter-spacing:.5px; }
+  .menubar .sep { width:1px; height:14px; background:var(--line); }
+  .menubar .right { margin-left:auto; display:flex; gap:14px; color:var(--sub); }
+
+  /* ===== 主体 ===== */
+  .main { flex:1 1 auto; display:flex; min-height:0; }
+
+  /* ===== 侧边栏 ===== */
+  .sidebar {
+    width:264px; flex:0 0 264px; background:var(--panel);
+    border-right:1px solid var(--line); display:flex; flex-direction:column; min-height:0;
+  }
+  .sb-head {
+    display:flex; align-items:center; justify-content:space-between;
+    padding:10px 12px 8px; font-size:12px; color:var(--sub);
+  }
+  .sb-head .seg { display:flex; border:1px solid var(--line); border-radius:6px; overflow:hidden; }
+  .sb-head .seg span {
+    font-size:11px; padding:2px 8px; color:var(--sub); cursor:pointer;
+  }
+  .sb-head .seg span.on { background:var(--accent); color:#fff; }
+  .tree { flex:1 1 auto; overflow-y:auto; padding:2px 8px 10px; }
+  .grp {
+    font-size:12px; font-weight:600; color:var(--text);
+    padding:8px 6px 4px; display:flex; align-items:center; gap:5px;
+  }
+  .grp .cnt { color:var(--sub); font-weight:400; font-size:11px; }
+  .tree-item {
+    display:flex; align-items:center; gap:8px; padding:5px 6px; border-radius:6px;
+    cursor:pointer;
+  }
+  .tree-item:hover { background:#EEF3F9; }
+  .tree-item.selected { background:#E3EDF8; box-shadow:inset 2px 0 0 var(--accent); }
+  .tree-item .thumb {
+    width:44px; height:30px; border-radius:4px; border:1px solid var(--line);
+    background:#fff; flex:0 0 44px; overflow:hidden; position:relative;
+  }
+  .tree-item .meta { flex:1 1 auto; min-width:0; }
+  .tree-item .name { font-size:13px; color:var(--text); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+  .tree-item .info { font-size:11px; color:var(--sub); }
+  .dot { width:8px; height:8px; border-radius:50%; flex:0 0 8px; }
+  .dot.done { background:var(--st-done); }
+  .dot.pending { background:var(--st-pending); }
+  .dot.ignore { background:var(--st-ignore); }
+  .tree-item.sub { padding-left:26px; }
+  .sb-foot {
+    border-top:1px solid var(--line); padding:8px 12px; font-size:11px; color:var(--sub);
+    background:var(--bg);
+  }
+
+  /* ===== 右侧 ===== */
+  .content { flex:1 1 auto; display:flex; flex-direction:column; min-width:0; background:var(--bg); }
+
+  /* 工具栏 */
+  .toolbar {
+    display:flex; align-items:center; gap:4px; padding:8px 14px;
+    border-bottom:1px solid var(--line); flex:0 0 auto;
+  }
+  .tool {
+    width:32px; height:32px; border-radius:6px; display:flex; align-items:center;
+    justify-content:center; cursor:pointer; color:var(--sub);
+  }
+  .tool:hover { background:#EEF3F9; }
+  .tool.on { background:var(--accent); color:#fff; }
+  .tool svg { width:18px; height:18px; }
+  .tb-sep { width:1px; height:20px; background:var(--line); margin:0 6px; }
+  .toolbar .right { margin-left:auto; display:flex; align-items:center; gap:8px; }
+  .btn {
+    border:1px solid var(--accent); color:var(--accent); background:var(--bg);
+    border-radius:8px; padding:5px 14px; font-size:12px; cursor:pointer;
+  }
+  .btn.solid { background:var(--accent); color:#fff; border-color:var(--accent); }
+
+  /* 画布 */
+  .canvas { flex:1 1 auto; display:flex; align-items:center; justify-content:center; overflow:hidden; position:relative; }
+  .stage { position:relative; width:360px; height:640px; }
+
+  /* 手机截图样例 */
+  .phone {
+    position:absolute; left:50%; top:50%; width:320px; height:600px; transform:translate(-50%,-50%);
+    border-radius:22px; border:5px solid #2B2B2B; background:#fff; overflow:hidden;
+    box-shadow:0 6px 24px rgba(33,33,33,.12);
+  }
+  .p-status { display:flex; justify-content:space-between; padding:7px 14px 4px; font-size:10px; color:#333; }
+  .p-header { text-align:center; font-size:14px; font-weight:600; padding:8px 0 12px; border-bottom:1px solid var(--line); }
+  .p-logo { text-align:center; font-size:42px; margin-top:38px; }
+  .p-appname { text-align:center; font-size:16px; font-weight:700; margin-top:6px; }
+  .p-sub { text-align:center; font-size:11px; color:var(--sub); margin-top:2px; }
+  .p-input {
+    margin:16px 26px 0; border:1px solid var(--line); border-radius:8px; padding:10px 12px;
+    font-size:12px; color:#B9B9B9; background:#FAFAFA;
+  }
+  .p-input.focus { border-color:var(--accent); color:var(--text); background:#fff; }
+  .p-btn {
+    margin:22px 26px 0; border-radius:8px; padding:11px; text-align:center;
+    background:var(--accent); color:#fff; font-size:14px; letter-spacing:6px;
+  }
+  .p-link { text-align:center; font-size:11px; color:var(--accent); margin-top:12px; }
+  .p-toast {
+    position:absolute; left:50%; transform:translateX(-50%); bottom:56px;
+    background:#4A4A4A; color:#fff; font-size:11px; padding:7px 14px; border-radius:6px;
+    white-space:nowrap;
+  }
+  .p-bottom { position:absolute; bottom:0; left:0; right:0; display:flex; border-top:1px solid var(--line); background:#fff; }
+  .p-bottom div { flex:1; text-align:center; font-size:10px; color:var(--sub); padding:7px 0 6px; }
+  .p-bottom div.on { color:var(--accent); }
+
+  /* 标注层 */
+  .anno { position:absolute; inset:0; width:100%; height:100%; pointer-events:none; }
+
+  /* 文字气泡 */
+  .bubble {
+    position:absolute; background:#fff; border:1.5px solid var(--err); color:var(--err);
+    font-size:12px; border-radius:6px; padding:6px 10px; box-shadow:0 2px 8px rgba(244,67,54,.15);
+    white-space:nowrap;
+  }
+  .bubble b { color:var(--err); }
+
+  /* 状态栏 */
+  .statusbar {
+    display:flex; align-items:center; gap:18px; padding:6px 16px; font-size:12px;
+    color:var(--sub); border-top:1px solid var(--line); flex:0 0 auto; background:var(--bg);
+  }
+  .statusbar .s-item b { color:var(--text); font-weight:600; }
+  .statusbar .right { margin-left:auto; display:flex; gap:16px; }
+</style>
+</head>
+<body>
+
+  <!-- 菜单栏 -->
+  <div class="menubar">
+    <span class="brand">PhotoAnnotator</span>
+    <span>文件</span><span>编辑</span><span>视图</span><span>工具</span><span>帮助</span>
+    <span class="sep"></span>
+    <span>打开工作目录</span>
+    <span>最近工作区 ▾</span>
+    <span class="right">⚙ 设置</span>
+  </div>
+
+  <div class="main">
+
+    <!-- 工作目录侧边栏 -->
+    <div class="sidebar">
+      <div class="sb-head">
+        <span>工作目录</span>
+        <span class="seg"><span class="on">列表</span><span>网格</span></span>
+      </div>
+      <div class="tree">
+        <div class="grp">📁 登录功能回归 <span class="cnt">(8)</span></div>
+        <div class="tree-item">
+          <div class="thumb"><div style="position:absolute;inset:4px;border-radius:2px;background:linear-gradient(135deg,#fff 0 55%,#4A90D9 55% 60%,#fff 60%);"></div></div>
+          <div class="meta"><div class="name">1.png</div><div class="info">登录页 · 156KB</div></div>
+          <span class="dot pending"></span>
+        </div>
+        <div class="tree-item selected">
+          <div class="thumb"><div style="position:absolute;inset:4px;border-radius:2px;background:#fff;border:1px solid #eee;"></div><div style="position:absolute;left:8px;top:8px;right:8px;height:5px;border-radius:2px;background:#F44336;"></div></div>
+          <div class="meta"><div class="name">2.png</div><div class="info">登录失败 · 340KB</div></div>
+          <span class="dot pending"></span>
+        </div>
+        <div class="tree-item">
+          <div class="thumb"><div style="position:absolute;inset:4px;border-radius:2px;background:#fff;border:1px solid #eee;"></div><div style="position:absolute;left:8px;top:8px;right:8px;height:5px;border-radius:2px;background:#4CAF50;"></div></div>
+          <div class="meta"><div class="name">3.png</div><div class="info">注册成功 · 221KB</div></div>
+          <span class="dot done"></span>
+        </div>
+        <div class="tree-item sub">
+          <div class="thumb"><div style="position:absolute;inset:4px;border-radius:2px;background:#fff;border:1px solid #eee;"></div><div style="position:absolute;left:8px;top:8px;width:10px;height:10px;border-radius:2px;background:#9E9E9E;"></div></div>
+          <div class="meta"><div class="name">4.png</div><div class="info">验证码页 · 180KB</div></div>
+          <span class="dot done"></span>
+        </div>
+        <div class="tree-item sub">
+          <div class="thumb"><div style="position:absolute;inset:4px;border-radius:2px;background:#fff;border:1px solid #eee;"></div><div style="position:absolute;left:8px;top:8px;right:8px;height:5px;border-radius:2px;background:#E0E0E0;"></div></div>
+          <div class="meta"><div class="name">5.png</div><div class="info">验证码错误 · 198KB</div></div>
+          <span class="dot ignore"></span>
+        </div>
+        <div class="grp">📁 支付流程 <span class="cnt">(4)</span></div>
+        <div class="tree-item">
+          <div class="thumb"><div style="position:absolute;inset:4px;border-radius:2px;background:#fff;border:1px solid #eee;"></div><div style="position:absolute;left:8px;top:8px;width:10px;height:10px;border-radius:2px;background:#4A90D9;"></div></div>
+          <div class="meta"><div class="name">6.png</div><div class="info">支付成功 · 289KB</div></div>
+          <span class="dot done"></span>
+        </div>
+        <div class="tree-item">
+          <div class="thumb"><div style="position:absolute;inset:4px;border-radius:2px;background:#fff;border:1px solid #eee;"></div><div style="position:absolute;left:8px;top:8px;width:10px;height:10px;border-radius:2px;background:#9E9E9E;"></div></div>
+          <div class="meta"><div class="name">7.png</div><div class="info">支付超时 · 302KB</div></div>
+          <span class="dot pending"></span>
+        </div>
+      </div>
+      <div class="sb-foot">最近：D:\test\登录功能回归 · 2026-09-01</div>
+    </div>
+
+    <!-- 右侧 -->
+    <div class="content">
+
+      <!-- 标注工具栏 -->
+      <div class="toolbar">
+        <div class="tool" title="矩形框">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><rect x="4" y="4" width="16" height="16" rx="1.5"/></svg>
+        </div>
+        <div class="tool" title="椭圆框">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><ellipse cx="12" cy="12" rx="8" ry="6"/></svg>
+        </div>
+        <div class="tool on" title="箭头">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M4 20 L16 8 M16 8 h-6 M16 8 v6"/></svg>
+        </div>
+        <div class="tool" title="自由画笔">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M4 18 C8 10 12 6 20 5 C16 10 14 14 13 19 C12 15 10 13 4 18 Z"/></svg>
+        </div>
+        <div class="tool" title="文字">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M5 6 V4 h14 v2 M12 4 v16 M9 20 h6"/></svg>
+        </div>
+        <div class="tool" title="马赛克/模糊">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><rect x="4" y="4" width="7" height="7" rx="1"/><rect x="13" y="4" width="7" height="7" rx="1"/><rect x="4" y="13" width="7" height="7" rx="1"/><rect x="13" y="13" width="7" height="7" rx="1"/></svg>
+        </div>
+        <div class="tool" title="序号标记">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><circle cx="12" cy="12" r="8"/><text x="12" y="15.5" text-anchor="middle" font-size="9" stroke="none" fill="currentColor" font-weight="700">1</text></svg>
+        </div>
+        <div class="tb-sep"></div>
+        <div class="tool" title="撤销">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M8 5 L4 9 L8 13 M4 9 h10 a5 5 0 0 1 0 10 h-3"/></svg>
+        </div>
+        <div class="tool" title="重做">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M16 5 L20 9 L16 13 M20 9 H10 a5 5 0 0 0 0 10 h3"/></svg>
+        </div>
+        <div class="right">
+          <button class="btn">复制 (Ctrl+C)</button>
+          <button class="btn solid">保存</button>
+        </div>
+      </div>
+
+      <!-- 画布 -->
+      <div class="canvas">
+        <div class="stage">
+          <!-- 手机截图样例 -->
+          <div class="phone">
+            <div class="p-status"><span>9:41</span><span>●●●● ▮▮▮ 58%</span></div>
+            <div class="p-header">XX商城</div>
+            <div class="p-logo">🛒</div>
+            <div class="p-appname">XX商城</div>
+            <div class="p-sub">让购物更简单</div>
+            <div class="p-input focus">请输入手机号</div>
+            <div class="p-input">请输入密码</div>
+            <div class="p-btn">登 录</div>
+            <div class="p-link">忘记密码？</div>
+            <div class="p-toast">登录失败，请重试</div>
+            <div class="p-bottom">
+              <div class="on">首页</div><div>分类</div><div>购物车</div><div>我的</div>
+            </div>
+          </div>
+
+          <!-- 标注层 -->
+          <svg class="anno" viewBox="0 0 360 640" fill="none">
+            <defs>
+              <marker id="arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+                <path d="M0 0 L10 5 L0 10 Z" fill="#F44336"/>
+              </marker>
+            </defs>
+            <!-- 红框圈出登录失败提示 -->
+            <rect x="128" y="472" width="105" height="28" rx="6" stroke="#F44336" stroke-width="2"/>
+            <!-- 箭头指向 -->
+            <path d="M128 486 L70 420" stroke="#F44336" stroke-width="2" marker-end="url(#arr)"/>
+            <path d="M70 420 L40 392" stroke="#F44336" stroke-width="2" marker-end="url(#arr)"/>
+            <!-- 序号 -->
+            <circle cx="233" cy="472" r="11" fill="#F44336"/>
+            <text x="233" y="476" text-anchor="middle" font-size="12" fill="#fff" font-weight="700">1</text>
+            <!-- 椭圆圈出密码框（次要问题） -->
+            <ellipse cx="180" cy="356" rx="86" ry="26" stroke="#FF9800" stroke-width="2" stroke-dasharray="5 4"/>
+            <circle cx="266" cy="330" r="9" fill="#FF9800"/>
+            <text x="266" y="334" text-anchor="middle" font-size="10" fill="#fff" font-weight="700">2</text>
+          </svg>
+
+          <!-- 文字气泡 -->
+          <div class="bubble" style="left:8px; top:348px;"><b>问题 1：</b>登录失败但无错误提示</div>
+          <div class="bubble" style="left:150px; top:286px; border-color:#FF9800; color:#E65100;"><b>问题 2：</b>密码框样式异常</div>
+        </div>
+      </div>
+
+      <!-- 状态栏 -->
+      <div class="statusbar">
+        <span class="s-item">当前图片 <b>2</b>/15</span>
+        <span class="s-item">已标注 <b style="color:var(--st-done);">3</b></span>
+        <span class="s-item">未处理 <b style="color:var(--st-pending);">12</b></span>
+        <span class="right">
+          <span>缩放 <b>100%</b></span>
+          <span>适应窗口</span>
+          <span>自动复制：开</span>
+        </span>
+      </div>
+    </div>
+  </div>
+
+</body>
+</html>
