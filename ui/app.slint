@@ -56,6 +56,7 @@ export component AppWindow inherits Window {
     callback tool-changed;
     callback undo;
     callback save;
+    callback copy;
     in-out property <length> pointer-x: 0px;
     in-out property <length> pointer-y: 0px;
     callback pointer-down;
@@ -98,6 +99,10 @@ export component AppWindow inherits Window {
             Button {
                 text: "保存";
                 clicked => { root.save(); }
+            }
+            Button {
+                text: "复制";
+                clicked => { root.copy(); }
             }
             Rectangle { width: 8px; }
             Button {

@@ -23,15 +23,15 @@ pub fn render_overlay(width: u32, height: u32, store: &AnnotationStore) -> Optio
     Some((width, height, unpremultiply(pixmap.data())))
 }
 
-/// 合成最终结果：把标注绘制到原图（RGBA，不透明）之上 → PNG 字节
+/// 合成最终结果：把标注绘制到原图之上（统一合成路径）
 /// background_rgba 为 straight-alpha RGBA 原图数据（长度须为 w*h*4）
-/// 这是导出/保存的统一路径：所见即所得
-pub fn composite_png(
+/// 返回 premultiplied 的 tiny-skia Pixmap（内部状态），供 PNG 编码或转换
+pub fn composite_to_pixmap(
     width: u32,
     height: u32,
     background_rgba: &[u8],
     store: &AnnotationStore,
-) -> Option<Vec<u8>> {
+) -> Option<Pixmap> {
     let len = width as usize * height as usize * 4;
     if len == 0 || background_rgba.len() != len {
         return None;
@@ -59,7 +59,28 @@ pub fn composite_png(
         draw_annotation(&mut pixmap, a);
     }
 
-    pixmap.encode_png().ok()
+    Some(pixmap)
+}
+
+/// 合成 → PNG 字节（保存文件用）
+pub fn composite_png(
+    width: u32,
+    height: u32,
+    background_rgba: &[u8],
+    store: &AnnotationStore,
+) -> Option<Vec<u8>> {
+    composite_to_pixmap(width, height, background_rgba, store)?.encode_png().ok()
+}
+
+/// 合成 → straight-alpha RGBA 字节（剪贴板粘贴用，arboard 期望 straight）
+pub fn composite_rgba(
+    width: u32,
+    height: u32,
+    background_rgba: &[u8],
+    store: &AnnotationStore,
+) -> Option<Vec<u8>> {
+    let pixmap = composite_to_pixmap(width, height, background_rgba, store)?;
+    Some(unpremultiply(pixmap.data()))
 }
 
 fn draw_annotation(pixmap: &mut Pixmap, a: &Annotation) {

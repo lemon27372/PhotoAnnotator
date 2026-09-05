@@ -357,6 +357,52 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         });
     }
+    {
+        // 复制：合成标注到原图 → 剪贴板（Ctrl+C 的基础）
+        let weak = app.as_weak();
+        let state = state.clone();
+        app.on_copy(move || {
+            let (Some(app), st) = (weak.upgrade(), state.borrow()) else {
+                return;
+            };
+            if st.image_width == 0 {
+                app.set_status(SharedString::from("没有可复制的图片"));
+                return;
+            }
+            let Some(rgba) = canvas::overlay::composite_rgba(
+                st.image_width,
+                st.image_height,
+                &st.image_rgba,
+                &st.store,
+            ) else {
+                app.set_status(SharedString::from("合成失败"));
+                return;
+            };
+            let w = st.image_width as usize;
+            let h = st.image_height as usize;
+            drop(st);
+            match arboard::Clipboard::new() {
+                Ok(mut cb) => {
+                    let img = arboard::ImageData {
+                        width: w,
+                        height: h,
+                        bytes: std::borrow::Cow::Owned(rgba),
+                    };
+                    match cb.set_image(img) {
+                        Ok(_) => {
+                            app.set_status(SharedString::from("已复制到剪贴板"));
+                        }
+                        Err(e) => {
+                            app.set_status(SharedString::from(format!("复制失败: {e}")));
+                        }
+                    }
+                }
+                Err(e) => {
+                    app.set_status(SharedString::from(format!("剪贴板不可用: {e}")));
+                }
+            }
+        });
+    }
 
     // 5. 指针交互回调（按下/拖动/释放，按当前工具分发）
     {

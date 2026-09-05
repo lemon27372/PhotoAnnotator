@@ -22,6 +22,8 @@ tiny-skia = "0.11"
 rusqlite = { version = "0.37", features = ["bundled"] }
 # 图片解码（裁剪特性控制体积：PNG/JPG/BMP/GIF/WebP，排除 exr/tiff/avif 等重型格式）
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "bmp", "gif", "webp"] }
+# 剪贴板（Ctrl+C 复制标注结果）
+arboard = "3"
 
 [build-dependencies]
 # 编译 ui/*.slint 声明文件（build.rs 使用）
