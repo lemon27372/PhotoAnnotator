@@ -72,42 +72,42 @@ export component AppWindow inherits Window {
             spacing: 4px;
             Button {
                 text: "浏览";
-                clicked => { root.active-tool = 0; root.tool-changed(); }
+                clicked => { root.active-tool = 0; root.tool-changed(); canvas-fs.focus(); }
             }
             Button {
                 text: "矩形";
-                clicked => { root.active-tool = 1; root.tool-changed(); }
+                clicked => { root.active-tool = 1; root.tool-changed(); canvas-fs.focus(); }
             }
             Button {
                 text: "椭圆";
-                clicked => { root.active-tool = 2; root.tool-changed(); }
+                clicked => { root.active-tool = 2; root.tool-changed(); canvas-fs.focus(); }
             }
             Button {
                 text: "箭头";
-                clicked => { root.active-tool = 3; root.tool-changed(); }
+                clicked => { root.active-tool = 3; root.tool-changed(); canvas-fs.focus(); }
             }
             Button {
                 text: "画笔";
-                clicked => { root.active-tool = 4; root.tool-changed(); }
+                clicked => { root.active-tool = 4; root.tool-changed(); canvas-fs.focus(); }
             }
             Rectangle { width: 8px; }
             Button {
                 text: "撤销";
-                clicked => { root.undo(); }
+                clicked => { root.undo(); canvas-fs.focus(); }
             }
             Rectangle { width: 8px; }
             Button {
                 text: "保存";
-                clicked => { root.save(); }
+                clicked => { root.save(); canvas-fs.focus(); }
             }
             Button {
                 text: "复制";
-                clicked => { root.copy(); }
+                clicked => { root.copy(); canvas-fs.focus(); }
             }
             Rectangle { width: 8px; }
             Button {
                 text: "重置";
-                clicked => { root.reset-view(); }
+                clicked => { root.reset-view(); canvas-fs.focus(); }
             }
         }
 
@@ -120,81 +120,99 @@ export component AppWindow inherits Window {
             border-color: #E0E0E0;
             clip: true;
 
-            // 原图层
-            Image {
-                source: root.current-image;
-                x: root.disp-x;
-                y: root.disp-y;
-                width: root.image-width * root.disp-scale;
-                height: root.image-height * root.disp-scale;
-                image-fit: fill;
-            }
-            // 标注层（已完成的图元）
-            Image {
-                source: root.overlay-image;
-                x: root.disp-x;
-                y: root.disp-y;
-                width: root.image-width * root.disp-scale;
-                height: root.image-height * root.disp-scale;
-                image-fit: fill;
-            }
-            // 绘制中预览矩形（原生元素，拖动实时跟随；线宽 3px 与标注层一致，随缩放）
-            Rectangle {
-                visible: root.preview-visible;
-                x: root.disp-x + root.preview-x * root.disp-scale;
-                y: root.disp-y + root.preview-y * root.disp-scale;
-                width: root.preview-w * root.disp-scale;
-                height: root.preview-h * root.disp-scale;
-                border-width: 3px * root.disp-scale;
-                border-color: #F44336;
-            }
-            // 绘制中预览（椭圆描边 / 箭头线段+实心三角；viewbox=整图，坐标即图片像素）
-            Path {
-                visible: root.preview-path-visible;
-                x: root.disp-x;
-                y: root.disp-y;
-                width: root.image-width * root.disp-scale;
-                height: root.image-height * root.disp-scale;
-                viewbox-x: 0;
-                viewbox-y: 0;
-                viewbox-width: root.image-width / 1px;
-                viewbox-height: root.image-height / 1px;
-                commands: root.preview-commands;
-                stroke: #F44336;
-                stroke-width: root.preview-stroke-width;
-                fill: root.preview-fill;
-            }
+            // 画布交互层：FocusScope 捕获键盘（点击画布后生效）
+            canvas-fs := FocusScope {
+                // ---- 键盘快捷键（@keys 字面量；修饰键用 Control/Shift/Alt/Meta）----
+                KeyBinding { keys: @keys("0"); activated => { root.active-tool = 0; root.tool-changed(); } }
+                KeyBinding { keys: @keys("1"); activated => { root.active-tool = 1; root.tool-changed(); } }
+                KeyBinding { keys: @keys("2"); activated => { root.active-tool = 2; root.tool-changed(); } }
+                KeyBinding { keys: @keys("3"); activated => { root.active-tool = 3; root.tool-changed(); } }
+                KeyBinding { keys: @keys("4"); activated => { root.active-tool = 4; root.tool-changed(); } }
+                KeyBinding { keys: @keys("r"); activated => { root.active-tool = 1; root.tool-changed(); } }
+                KeyBinding { keys: @keys("o"); activated => { root.active-tool = 2; root.tool-changed(); } }
+                KeyBinding { keys: @keys("a"); activated => { root.active-tool = 3; root.tool-changed(); } }
+                KeyBinding { keys: @keys("p"); activated => { root.active-tool = 4; root.tool-changed(); } }
+                KeyBinding { keys: @keys(Control+Z); activated => { root.undo(); } }
+                KeyBinding { keys: @keys(Control+C); activated => { root.copy(); } }
+                KeyBinding { keys: @keys(Control+S); activated => { root.save(); } }
 
-            // 手势层
-            touch := TouchArea {
-                scroll-event(event) => {
-                    root.pointer-x = touch.mouse_x;
-                    root.pointer-y = touch.mouse_y;
-                    if event.delta_y > 0 {
-                        root.zoom-in();
-                    } else if event.delta_y < 0 {
-                        root.zoom-out();
-                    }
-                    return EventResult.accept;
+                // 原图层
+                Image {
+                    source: root.current-image;
+                    x: root.disp-x;
+                    y: root.disp-y;
+                    width: root.image-width * root.disp-scale;
+                    height: root.image-height * root.disp-scale;
+                    image-fit: fill;
                 }
-                // 仅左键触发绘制/平移
-                pointer-event(event) => {
-                    if event.button == PointerEventButton.left {
-                        if event.kind == PointerEventKind.down {
-                            root.pointer-x = touch.mouse_x;
-                            root.pointer-y = touch.mouse_y;
-                            root.pointer-down();
-                        } else if event.kind == PointerEventKind.up {
-                            root.pointer-x = touch.mouse_x;
-                            root.pointer-y = touch.mouse_y;
-                            root.pointer-up();
+                // 标注层（已完成的图元）
+                Image {
+                    source: root.overlay-image;
+                    x: root.disp-x;
+                    y: root.disp-y;
+                    width: root.image-width * root.disp-scale;
+                    height: root.image-height * root.disp-scale;
+                    image-fit: fill;
+                }
+                // 绘制中预览矩形（原生元素，拖动实时跟随；线宽 3px 与标注层一致，随缩放）
+                Rectangle {
+                    visible: root.preview-visible;
+                    x: root.disp-x + root.preview-x * root.disp-scale;
+                    y: root.disp-y + root.preview-y * root.disp-scale;
+                    width: root.preview-w * root.disp-scale;
+                    height: root.preview-h * root.disp-scale;
+                    border-width: 3px * root.disp-scale;
+                    border-color: #F44336;
+                }
+                // 绘制中预览（椭圆描边 / 箭头线段+实心三角；viewbox=整图，坐标即图片像素）
+                Path {
+                    visible: root.preview-path-visible;
+                    x: root.disp-x;
+                    y: root.disp-y;
+                    width: root.image-width * root.disp-scale;
+                    height: root.image-height * root.disp-scale;
+                    viewbox-x: 0;
+                    viewbox-y: 0;
+                    viewbox-width: root.image-width / 1px;
+                    viewbox-height: root.image-height / 1px;
+                    commands: root.preview-commands;
+                    stroke: #F44336;
+                    stroke-width: root.preview-stroke-width;
+                    fill: root.preview-fill;
+                }
+
+                // 手势层
+                touch := TouchArea {
+                    scroll-event(event) => {
+                        root.pointer-x = touch.mouse_x;
+                        root.pointer-y = touch.mouse_y;
+                        if event.delta_y > 0 {
+                            root.zoom-in();
+                        } else if event.delta_y < 0 {
+                            root.zoom-out();
+                        }
+                        return EventResult.accept;
+                    }
+                    // 仅左键触发绘制/平移
+                    pointer-event(event) => {
+                        if event.button == PointerEventButton.left {
+                            if event.kind == PointerEventKind.down {
+                                canvas-fs.focus(); // 点击画布 → 键盘焦点交给快捷键层
+                                root.pointer-x = touch.mouse_x;
+                                root.pointer-y = touch.mouse_y;
+                                root.pointer-down();
+                            } else if event.kind == PointerEventKind.up {
+                                root.pointer-x = touch.mouse_x;
+                                root.pointer-y = touch.mouse_y;
+                                root.pointer-up();
+                            }
                         }
                     }
-                }
-                moved => {
-                    root.pointer-x = touch.mouse_x;
-                    root.pointer-y = touch.mouse_y;
-                    root.pointer-move();
+                    moved => {
+                        root.pointer-x = touch.mouse_x;
+                        root.pointer-y = touch.mouse_y;
+                        root.pointer-move();
+                    }
                 }
             }
         }
