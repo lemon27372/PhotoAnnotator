@@ -4,6 +4,7 @@
 //   第二阶段 —— 图片加载、视图状态机、标注图元（矩形起步）
 
 pub mod annotation;
+pub mod font;
 pub mod loader;
 pub mod overlay;
 pub mod render;

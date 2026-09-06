@@ -2,6 +2,44 @@
 // 预览矩形用原生元素实时显示（拖动流畅），完成后并入标注层位图
 import { Button } from "std-widgets.slint";
 
+/// 单行文字输入组件：FocusScope + 内建 TextInput（支持中文 IME）
+/// 相比 std LineEdit 可通过 forward-focus 编程聚焦（显示即输入，无需二次点击）
+component InlineTextInput inherits FocusScope {
+    in-out property <string> text <=> input.text;
+    callback accepted <=> input.accepted;
+    width: 260px;
+    height: 32px;
+
+    Rectangle {
+        width: 100%;
+        height: 100%;
+        background: #FFFFFF;
+        border-radius: 6px;
+        border-width: 1px;
+        border-color: #4A90D9;
+
+        input := TextInput {
+            x: 6px;
+            width: parent.width - 12px;
+            height: 100%;
+            vertical-alignment: center;
+            color: #212121;
+            font-size: 14px;
+            single-line: true;
+        }
+    }
+    // FocusScope 获得焦点时转发给内部 TextInput
+    forward-focus: input;
+}
+
+/// 文字标注的显示项（图片坐标；随视图变换缩放）
+export struct TextDisplay {
+    x: float,
+    y: float,
+    text: string,
+    font-size: float,
+}
+
 export component AppWindow inherits Window {
     title: "PhotoAnnotator";
     preferred-width: 1000px;
@@ -43,6 +81,13 @@ export component AppWindow inherits Window {
     in-out property <brush> preview-fill: transparent;
     // Path 描边宽度（viewbox 单位=图片像素）：椭圆 3px，箭头 5px
     in-out property <length> preview-stroke-width: 3px;
+    // ---- 文字标注显示（Slint 原生 Text，随视图缩放）----
+    in-out property <[TextDisplay]> text-annotations: [];
+    // 文字输入框（画布坐标定位；Enter 提交）
+    in-out property <bool> text-input-visible: false;
+    in-out property <length> text-input-x: 0px;
+    in-out property <length> text-input-y: 0px;
+    in-out property <string> text-draft: "";
 
     // ---- 自动适配计算（fit 模式实时跟随视口）----
     property <float> fit-scale: min(min(root.viewport-width / max(root.image-width, 1px), root.viewport-height / max(root.image-height, 1px)), 1.0);
@@ -66,6 +111,8 @@ export component AppWindow inherits Window {
     callback escape-pressed;
     // Ctrl+M：极简模式切换（Rust 控制提示条点亮/熄灭）
     callback toggle-minimal;
+    // 文字输入确认（Enter）
+    callback text-commit;
     in-out property <length> pointer-x: 0px;
     in-out property <length> pointer-y: 0px;
     callback pointer-down;
@@ -100,6 +147,10 @@ export component AppWindow inherits Window {
                 text: "画笔";
                 clicked => { root.active-tool = 4; root.tool-changed(); canvas-fs.focus(); }
             }
+            Button {
+                text: "文字";
+                clicked => { root.active-tool = 5; root.tool-changed(); canvas-fs.focus(); }
+            }
             Rectangle { width: 8px; }
             Button {
                 text: "撤销";
@@ -132,21 +183,23 @@ export component AppWindow inherits Window {
 
             // 画布交互层：FocusScope 捕获键盘（点击画布后生效）
             canvas-fs := FocusScope {
-                // ---- 键盘快捷键（@keys 字面量；修饰键用 Control/Shift/Alt/Meta）----
-                KeyBinding { keys: @keys("0"); activated => { root.active-tool = 0; root.tool-changed(); } }
-                KeyBinding { keys: @keys("1"); activated => { root.active-tool = 1; root.tool-changed(); } }
-                KeyBinding { keys: @keys("2"); activated => { root.active-tool = 2; root.tool-changed(); } }
-                KeyBinding { keys: @keys("3"); activated => { root.active-tool = 3; root.tool-changed(); } }
-                KeyBinding { keys: @keys("4"); activated => { root.active-tool = 4; root.tool-changed(); } }
-                KeyBinding { keys: @keys("r"); activated => { root.active-tool = 1; root.tool-changed(); } }
-                KeyBinding { keys: @keys("o"); activated => { root.active-tool = 2; root.tool-changed(); } }
-                KeyBinding { keys: @keys("a"); activated => { root.active-tool = 3; root.tool-changed(); } }
-                KeyBinding { keys: @keys("p"); activated => { root.active-tool = 4; root.tool-changed(); } }
-                KeyBinding { keys: @keys(Control+Z); activated => { root.undo(); } }
-                KeyBinding { keys: @keys(Control+C); activated => { root.copy(); } }
-                KeyBinding { keys: @keys(Control+S); activated => { root.save(); } }
-                // 极简模式切换 / Esc 取消或退出
-                KeyBinding { keys: @keys(Control+M); activated => { root.toggle-minimal(); } }
+                // ---- 键盘快捷键（@keys 字面量；输入文字时禁用，避免劫持按键）----
+                KeyBinding { enabled: !root.text-input-visible; keys: @keys("0"); activated => { root.active-tool = 0; root.tool-changed(); } }
+                KeyBinding { enabled: !root.text-input-visible; keys: @keys("1"); activated => { root.active-tool = 1; root.tool-changed(); } }
+                KeyBinding { enabled: !root.text-input-visible; keys: @keys("2"); activated => { root.active-tool = 2; root.tool-changed(); } }
+                KeyBinding { enabled: !root.text-input-visible; keys: @keys("3"); activated => { root.active-tool = 3; root.tool-changed(); } }
+                KeyBinding { enabled: !root.text-input-visible; keys: @keys("4"); activated => { root.active-tool = 4; root.tool-changed(); } }
+                KeyBinding { enabled: !root.text-input-visible; keys: @keys("5"); activated => { root.active-tool = 5; root.tool-changed(); } }
+                KeyBinding { enabled: !root.text-input-visible; keys: @keys("r"); activated => { root.active-tool = 1; root.tool-changed(); } }
+                KeyBinding { enabled: !root.text-input-visible; keys: @keys("o"); activated => { root.active-tool = 2; root.tool-changed(); } }
+                KeyBinding { enabled: !root.text-input-visible; keys: @keys("a"); activated => { root.active-tool = 3; root.tool-changed(); } }
+                KeyBinding { enabled: !root.text-input-visible; keys: @keys("p"); activated => { root.active-tool = 4; root.tool-changed(); } }
+                KeyBinding { enabled: !root.text-input-visible; keys: @keys("t"); activated => { root.active-tool = 5; root.tool-changed(); } }
+                KeyBinding { enabled: !root.text-input-visible; keys: @keys(Control+Z); activated => { root.undo(); } }
+                KeyBinding { enabled: !root.text-input-visible; keys: @keys(Control+C); activated => { root.copy(); } }
+                KeyBinding { enabled: !root.text-input-visible; keys: @keys(Control+S); activated => { root.save(); } }
+                KeyBinding { enabled: !root.text-input-visible; keys: @keys(Control+M); activated => { root.toggle-minimal(); } }
+                // Esc 保持可用：取消文字输入/绘制/退出极简
                 KeyBinding { keys: @keys(Escape); activated => { root.escape-pressed(); } }
 
                 // 原图层
@@ -194,6 +247,15 @@ export component AppWindow inherits Window {
                     fill: root.preview-fill;
                 }
 
+                // 文字标注显示（随视图缩放；item 坐标单位为图片像素）
+                for item in root.text-annotations: Text {
+                    x: root.disp-x + item.x * 1px * root.disp-scale;
+                    y: root.disp-y + item.y * 1px * root.disp-scale;
+                    text: item.text;
+                    font-size: item.font-size * 1px * root.disp-scale;
+                    color: #F44336;
+                }
+
                 // 手势层
                 touch := TouchArea {
                     scroll-event(event) => {
@@ -214,6 +276,10 @@ export component AppWindow inherits Window {
                                 root.pointer-x = touch.mouse_x;
                                 root.pointer-y = touch.mouse_y;
                                 root.pointer-down();
+                                // 文字工具落点：输入框显示后立即聚焦（forward 到 TextInput，可直接打字/IME）
+                                if root.active-tool == 5 {
+                                    inline-text.focus();
+                                }
                             } else if event.kind == PointerEventKind.up {
                                 root.pointer-x = touch.mouse_x;
                                 root.pointer-y = touch.mouse_y;
@@ -226,6 +292,15 @@ export component AppWindow inherits Window {
                         root.pointer-y = touch.mouse_y;
                         root.pointer-move();
                     }
+                }
+
+                // 文字输入框（浮于画布；点击落点后自动聚焦，Enter 确认提交）
+                inline-text := InlineTextInput {
+                    visible: root.text-input-visible;
+                    x: root.text-input-x;
+                    y: root.text-input-y;
+                    text <=> root.text-draft;
+                    accepted => { root.text-commit(); }
                 }
             }
 

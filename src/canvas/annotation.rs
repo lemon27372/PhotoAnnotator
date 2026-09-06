@@ -14,6 +14,7 @@ pub enum Tool {
     Ellipse = 2,
     Arrow = 3,
     Pen = 4,
+    Text = 5,
 }
 
 impl Tool {
@@ -23,6 +24,7 @@ impl Tool {
             2 => Tool::Ellipse,
             3 => Tool::Arrow,
             4 => Tool::Pen,
+            5 => Tool::Text,
             _ => Tool::Browse,
         }
     }
@@ -32,6 +34,7 @@ impl Tool {
 pub const DEFAULT_COLOR: u32 = 0xF44336; // 错误红
 pub const DEFAULT_STROKE_WIDTH: f32 = 3.0; // 框类（矩形/椭圆）线宽，图片像素
 pub const ARROW_STROKE_WIDTH: f32 = 5.0; // 箭头线宽（视觉上应比框粗，图片像素）
+pub const DEFAULT_FONT_SIZE: f32 = 24.0; // 文字标注字号（图片像素）
 
 /// 通用"框形"标注数据：外接矩形两点式（图片像素坐标）+ 样式
 #[derive(Clone, Debug)]
@@ -123,6 +126,17 @@ pub enum Annotation {
     Ellipse(BoxShape),
     Arrow(LineShape),
     Pen(PenShape),
+    Text(TextAnnotation),
+}
+
+/// 文字标注：锚点为文字左上角（图片像素坐标）
+#[derive(Clone, Debug)]
+pub struct TextAnnotation {
+    pub x: f32,
+    pub y: f32,
+    pub text: String,
+    pub color: u32,     // 0xRRGGBB
+    pub font_size: f32, // 图片像素字号
 }
 
 impl Annotation {
@@ -150,12 +164,24 @@ impl Annotation {
         })
     }
 
+    /// 构造文字标注（左上角锚点，默认红色）
+    pub fn text(x: f32, y: f32, text: String) -> Self {
+        Annotation::Text(TextAnnotation {
+            x,
+            y,
+            text,
+            color: DEFAULT_COLOR,
+            font_size: DEFAULT_FONT_SIZE,
+        })
+    }
+
     /// 图元是否有有效面积/长度
     pub fn has_area(&self) -> bool {
         match self {
             Annotation::Rect(b) | Annotation::Ellipse(b) => b.has_area(),
             Annotation::Arrow(l) => l.length() > 2.0,
             Annotation::Pen(p) => p.points.len() >= 2,
+            Annotation::Text(t) => !t.text.trim().is_empty(),
         }
     }
 }

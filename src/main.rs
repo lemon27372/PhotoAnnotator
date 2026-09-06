@@ -132,7 +132,7 @@ fn show_preview(app: &AppWindow, tool: Tool, x1: f32, y1: f32, x2: f32, y2: f32)
         Tool::Rect => show_rect_preview(app, x1, y1, x2, y2),
         Tool::Ellipse => show_ellipse_preview(app, x1, y1, x2, y2),
         Tool::Arrow => show_arrow_preview(app, x1, y1, x2, y2),
-        Tool::Pen | Tool::Browse => {}
+        Tool::Pen | Tool::Browse | Tool::Text => {}
     }
 }
 
@@ -203,6 +203,7 @@ fn annotated_save_path(original: Option<&str>) -> String {
 }
 
 /// 重渲染标注层（仅已完成的图元）并推到 Slint
+/// 同时同步文字标注列表到 Slint 显示层（撤销/新增后调用）
 fn update_overlay(app: &AppWindow, state: &AppState) {
     if let Some((w, h, bytes)) = canvas::overlay::render_overlay(
         state.image_width,
@@ -213,6 +214,42 @@ fn update_overlay(app: &AppWindow, state: &AppState) {
         buffer.make_mut_bytes().copy_from_slice(&bytes);
         app.set_overlay_image(Image::from_rgba8(buffer));
     }
+    // 文字标注走 Slint 原生 Text 显示
+    let texts: Vec<TextDisplay> = state
+        .store
+        .items
+        .iter()
+        .filter_map(|a| match a {
+            canvas::Annotation::Text(t) => Some(TextDisplay {
+                x: t.x,
+                y: t.y,
+                text: t.text.clone().into(),
+                font_size: t.font_size,
+            }),
+            _ => None,
+        })
+        .collect();
+    app.set_text_annotations(slint::ModelRc::from(std::rc::Rc::new(slint::VecModel::from(texts))));
+}
+
+/// 隐藏文字输入框并清空草稿
+fn hide_text_input(app: &AppWindow) {
+    app.set_text_input_visible(false);
+    app.set_text_draft(SharedString::from(""));
+}
+
+/// 若输入框有非空文字 → 提交为文字标注（返回是否提交）
+/// 输入框位置（画布坐标）换算为图片坐标作为文字锚点
+fn commit_text_input(app: &AppWindow, st: &mut AppState) -> bool {
+    let text = app.get_text_draft().trim().to_string();
+    if text.is_empty() {
+        return false;
+    }
+    let cx = app.get_text_input_x();
+    let cy = app.get_text_input_y();
+    let (ix, iy) = read_transform(app).canvas_to_image(cx, cy);
+    st.store.push(canvas::Annotation::text(ix, iy, text));
+    true
 }
 
 /// 按工具把两点式绘制结果构造成图元
@@ -221,7 +258,7 @@ fn annotation_from_shape(tool: Tool, x1: f32, y1: f32, x2: f32, y2: f32) -> Anno
         Tool::Rect => Annotation::rect(x1, y1, x2, y2),
         Tool::Ellipse => Annotation::ellipse(x1, y1, x2, y2),
         Tool::Arrow => Annotation::arrow(x1, y1, x2, y2),
-        Tool::Browse | Tool::Pen => unreachable!("浏览/画笔工具不会走两点式创建图元"),
+        Tool::Browse | Tool::Pen | Tool::Text => unreachable!("非两点式工具不走此创建路径"),
     }
 }
 
@@ -284,7 +321,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         });
     }
     {
-        // 工具切换：终止未完成的绘制/平移，隐藏残留预览，给出状态反馈
+        // 工具切换：终止未完成的绘制/平移，隐藏残留预览/输入框，给出状态反馈
         let weak = app.as_weak();
         let state = state.clone();
         app.on_tool_changed(move || {
@@ -293,12 +330,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             };
             st.interaction = Interaction::None;
             hide_previews(&app);
+            hide_text_input(&app);
             let msg = match Tool::from_id(app.get_active_tool()) {
                 Tool::Browse => "浏览工具：拖动平移 / 滚轮缩放",
                 Tool::Rect => "矩形工具：按住左键拖动画框",
                 Tool::Ellipse => "椭圆工具：按住左键拖动画框",
                 Tool::Arrow => "箭头工具：从起点拖到终点",
                 Tool::Pen => "画笔工具：按住左键手绘",
+                Tool::Text => "文字工具：点击画布放置文字",
             };
             app.set_status(SharedString::from(msg));
         });
@@ -403,14 +442,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         });
     }
     {
-        // Esc 层级处理：取消绘制 > 退出极简模式 > 提示
+        // Esc 层级处理：取消文字输入 > 取消绘制 > 退出极简模式 > 提示
         let weak = app.as_weak();
         let state = state.clone();
         app.on_escape_pressed(move || {
             let (Some(app), mut st) = (weak.upgrade(), state.borrow_mut()) else {
                 return;
             };
-            if !matches!(st.interaction, Interaction::None) {
+            if app.get_text_input_visible() {
+                // 0. 文字输入中 → 取消输入
+                hide_text_input(&app);
+                app.set_status(SharedString::from("已取消文字输入"));
+            } else if !matches!(st.interaction, Interaction::None) {
                 // 1. 有绘制/平移进行中 → 取消
                 st.interaction = Interaction::None;
                 hide_previews(&app);
@@ -453,6 +496,27 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         });
     }
+    {
+        // 文字输入确认（Enter）：提交文字标注到点击落点
+        let weak = app.as_weak();
+        let state = state.clone();
+        app.on_text_commit(move || {
+            let (Some(app), mut st) = (weak.upgrade(), state.borrow_mut()) else {
+                return;
+            };
+            let submitted = commit_text_input(&app, &mut st);
+            hide_text_input(&app);
+            if submitted {
+                update_overlay(&app, &st);
+                app.set_status(SharedString::from(format!(
+                    "已添加文字，共 {} 个标注",
+                    st.store.len()
+                )));
+            } else {
+                app.set_status(SharedString::from("输入为空，已取消"));
+            }
+        });
+    }
 
     // 5. 指针交互回调（按下/拖动/释放，按当前工具分发）
     {
@@ -464,7 +528,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             };
             let cx = app.get_pointer_x();
             let cy = app.get_pointer_y();
-            match Tool::from_id(app.get_active_tool()) {
+            // 输入框流转：文字工具下再次点击 = 先提交当前文字再开新框；
+            // 其他工具下点击（含切工具回调） = 丢弃输入
+            let current_tool = Tool::from_id(app.get_active_tool());
+            if app.get_text_input_visible() && current_tool != Tool::Text {
+                hide_text_input(&app);
+            }
+            match current_tool {
                 Tool::Browse => {
                     // 平移需自由模式（视图固定，随鼠标移动）
                     ensure_free(&app);
@@ -488,6 +558,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         points: vec![(ix, iy)],
                     };
                     app.set_status(SharedString::from("画笔 · 按住手绘"));
+                }
+                Tool::Text => {
+                    // 点击落点 → 在点击处弹出输入框（画布坐标定位）
+                    // 若上一个输入框有内容，先提交（点他处 = 确认当前文字）
+                    if app.get_text_input_visible() && commit_text_input(&app, &mut st) {
+                        update_overlay(&app, &st);
+                    }
+                    hide_previews(&app);
+                    app.set_text_input_x(cx);
+                    app.set_text_input_y(cy);
+                    app.set_text_draft(SharedString::from(""));
+                    app.set_text_input_visible(true);
+                    app.set_status(SharedString::from("输入文字后按 Enter 确认"));
                 }
             }
         });

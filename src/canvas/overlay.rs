@@ -8,8 +8,7 @@ use tiny_skia::{Color, LineCap, Paint, Path, PathBuilder, Pixmap, Rect, Shader, 
 use super::annotation::{Annotation, AnnotationStore};
 
 /// 渲染标注层，返回 (宽, 高, straight-alpha RGBA 字节)
-/// 仅包含已完成的图元；绘制中预览走 Slint 原生元素（见 app.slint preview-*），
-/// 避免拖动时全图重渲染导致卡顿
+/// 仅矢量图元入 overlay 位图；文字标注由 Slint Text 元素显示（此处跳过）
 pub fn render_overlay(width: u32, height: u32, store: &AnnotationStore) -> Option<(u32, u32, Vec<u8>)> {
     if width == 0 || height == 0 {
         return None;
@@ -17,7 +16,7 @@ pub fn render_overlay(width: u32, height: u32, store: &AnnotationStore) -> Optio
     let mut pixmap = Pixmap::new(width, height)?; // 初始全透明
 
     for a in store.items.iter() {
-        draw_annotation(&mut pixmap, a);
+        draw_annotation(&mut pixmap, a, None);
     }
 
     Some((width, height, unpremultiply(pixmap.data())))
@@ -55,8 +54,10 @@ pub fn composite_to_pixmap(
         }
     }
 
+    // 导出合成需要文字渲染 → 加载中文字体（一次）
+    let font = super::font::load_cjk_font();
     for a in store.items.iter() {
-        draw_annotation(&mut pixmap, a);
+        draw_annotation(&mut pixmap, a, font.as_ref());
     }
 
     Some(pixmap)
@@ -83,7 +84,7 @@ pub fn composite_rgba(
     Some(unpremultiply(pixmap.data()))
 }
 
-fn draw_annotation(pixmap: &mut Pixmap, a: &Annotation) {
+fn draw_annotation(pixmap: &mut Pixmap, a: &Annotation, font: Option<&fontdue::Font>) {
     match a {
         Annotation::Rect(b) | Annotation::Ellipse(b) => {
             let w = b.x2 - b.x1;
@@ -102,7 +103,7 @@ fn draw_annotation(pixmap: &mut Pixmap, a: &Annotation) {
                     pb.push_oval(rect);
                     pb.finish().unwrap_or_else(|| PathBuilder::from_rect(rect))
                 }
-                Annotation::Arrow(_) | Annotation::Pen(_) => unreachable!(),
+                Annotation::Arrow(_) | Annotation::Pen(_) | Annotation::Text(_) => unreachable!(),
             };
             stroke_path(pixmap, &path, b.color, b.width);
         }
@@ -169,6 +170,79 @@ fn draw_annotation(pixmap: &mut Pixmap, a: &Annotation) {
                 };
                 pixmap.stroke_path(&path, &paint, &stroke, Transform::identity(), None);
             }
+        }
+        Annotation::Text(t) => {
+            // 导出时文字栅格化绘制；无字体可用则跳过（显示层不受影响）
+            if let Some(font) = font {
+                draw_text(pixmap, t, font);
+            }
+        }
+    }
+}
+
+/// 文字逐字符栅格化并按 src-over 合成到 premultiplied pixmap
+fn draw_text(pixmap: &mut Pixmap, t: &super::annotation::TextAnnotation, font: &fontdue::Font) {
+    let size = t.font_size.max(4.0);
+    let ascent = font
+        .horizontal_line_metrics(size)
+        .map(|m| m.ascent)
+        .unwrap_or(size * 0.8);
+    let baseline = t.y + ascent;
+    // straight 颜色分量（alpha 全不透明）
+    let (cr, cg, cb) = (
+        ((t.color >> 16) & 0xFF) as f32,
+        ((t.color >> 8) & 0xFF) as f32,
+        (t.color & 0xFF) as f32,
+    );
+    let mut pen_x = t.x;
+    for ch in t.text.chars() {
+        let (metrics, coverage) = font.rasterize(ch, size);
+        let px = pen_x + metrics.xmin as f32;
+        let py = baseline + metrics.ymin as f32;
+        blend_coverage(pixmap, px, py, metrics.width as u32, metrics.height as u32, &coverage, cr, cg, cb);
+        pen_x += metrics.advance_width;
+    }
+}
+
+/// 将 coverage（0-255 alpha）按颜色 src-over 合成到 pixmap（premultiplied）
+fn blend_coverage(
+    pixmap: &mut Pixmap,
+    x: f32,
+    y: f32,
+    w: u32,
+    h: u32,
+    coverage: &[u8],
+    cr: f32,
+    cg: f32,
+    cb: f32,
+) {
+    let pw = pixmap.width() as f32;
+    let ph = pixmap.height() as f32;
+    for row in 0..h {
+        for col in 0..w {
+            let a = coverage[(row * w + col) as usize];
+            if a == 0 {
+                continue;
+            }
+            let dx = x + col as f32;
+            let dy = y + row as f32;
+            if dx < 0.0 || dy < 0.0 || dx >= pw || dy >= ph {
+                continue;
+            }
+            let idx = (dy as u32 * pixmap.width() + dx as u32) as usize * 4;
+            let sa = a as f32 / 255.0;
+            let inv = 1.0 - sa;
+            let data = pixmap.data_mut();
+            let (dr, dg, db, da) = (
+                data[idx] as f32,
+                data[idx + 1] as f32,
+                data[idx + 2] as f32,
+                data[idx + 3] as f32,
+            );
+            data[idx] = (cr * sa + dr * inv).round() as u8;
+            data[idx + 1] = (cg * sa + dg * inv).round() as u8;
+            data[idx + 2] = (cb * sa + db * inv).round() as u8;
+            data[idx + 3] = (255.0 * sa + da * inv).round() as u8;
         }
     }
 }
