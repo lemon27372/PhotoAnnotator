@@ -361,8 +361,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // 复制：合成标注到原图 → 剪贴板（Ctrl+C 的基础）
         let weak = app.as_weak();
         let state = state.clone();
-        app.on_copy(move || {
-            let (Some(app), st) = (weak.upgrade(), state.borrow()) else {
+        app.on_copy(move || {            let (Some(app), st) = (weak.upgrade(), state.borrow()) else {
                 return;
             };
             if st.image_width == 0 {
@@ -400,6 +399,57 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 Err(e) => {
                     app.set_status(SharedString::from(format!("剪贴板不可用: {e}")));
                 }
+            }
+        });
+    }
+    {
+        // Esc 层级处理：取消绘制 > 退出极简模式 > 提示
+        let weak = app.as_weak();
+        let state = state.clone();
+        app.on_escape_pressed(move || {
+            let (Some(app), mut st) = (weak.upgrade(), state.borrow_mut()) else {
+                return;
+            };
+            if !matches!(st.interaction, Interaction::None) {
+                // 1. 有绘制/平移进行中 → 取消
+                st.interaction = Interaction::None;
+                hide_previews(&app);
+                app.set_status(SharedString::from("已取消"));
+            } else if app.get_minimal_mode() {
+                // 2. 极简模式且无绘制 → 退出极简
+                app.set_minimal_mode(false);
+                app.set_status(SharedString::from("已退出极简模式"));
+            } else {
+                // 3. 完整模式无操作 → 提示入口
+                app.set_status(SharedString::from("极简模式: Ctrl+M"));
+            }
+        });
+    }
+    {
+        // Ctrl+M：切换极简模式；进入时点亮提示条，3 秒后自动熄灭
+        let weak = app.as_weak();
+        let tip_timer = Rc::new(RefCell::new(Timer::default()));
+        app.on_toggle_minimal(move || {
+            let Some(app) = weak.upgrade() else {
+                return;
+            };
+            let minimal = !app.get_minimal_mode();
+            app.set_minimal_mode(minimal);
+            if minimal {
+                app.set_minimal_tip_visible(true);
+                // 重置/启动 3 秒熄灭定时器
+                let weak = weak.clone();
+                let timer = tip_timer.clone();
+                timer.borrow().stop();
+                timer.borrow().start(TimerMode::SingleShot, Duration::from_millis(3000), move || {
+                    if let Some(app) = weak.upgrade() {
+                        app.set_minimal_tip_visible(false);
+                    }
+                });
+                app.set_status(SharedString::from("极简模式（提示 3 秒后消失）"));
+            } else {
+                app.set_minimal_tip_visible(false);
+                app.set_status(SharedString::from("已退出极简模式"));
             }
         });
     }

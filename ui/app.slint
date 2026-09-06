@@ -23,6 +23,11 @@ export component AppWindow inherits Window {
     in-out property <bool> fit-mode: true;
     // 当前工具：0=浏览 1=矩形
     in-out property <int> active-tool: 0;
+    // 极简模式：隐藏工具条/状态栏，仅画布 + 全键盘操作（Ctrl+M 切换）
+    in-out property <bool> minimal-mode: false;
+    // 极简模式提示条可见（进入极简时点亮，3 秒后 Rust 熄灭）
+    in-out property <bool> minimal-tip-visible: true;
+    property <string> minimal-tip: "极简模式 · Ctrl+M 退出 · Esc 取消/退出";
 
     // ---- 绘制中预览 ----
     // 矩形预览（原生 Rectangle，拖动流畅）
@@ -57,6 +62,10 @@ export component AppWindow inherits Window {
     callback undo;
     callback save;
     callback copy;
+    // Esc：优先取消当前绘制，无绘制且极简模式时退出极简模式
+    callback escape-pressed;
+    // Ctrl+M：极简模式切换（Rust 控制提示条点亮/熄灭）
+    callback toggle-minimal;
     in-out property <length> pointer-x: 0px;
     in-out property <length> pointer-y: 0px;
     callback pointer-down;
@@ -64,8 +73,9 @@ export component AppWindow inherits Window {
     callback pointer-up;
 
     VerticalLayout {
-        // ---- 工具条 ----
+        // ---- 工具条（极简模式隐藏）----
         HorizontalLayout {
+            visible: !root.minimal-mode;
             height: 36px;
             padding-left: 8px;
             padding-right: 8px;
@@ -135,6 +145,9 @@ export component AppWindow inherits Window {
                 KeyBinding { keys: @keys(Control+Z); activated => { root.undo(); } }
                 KeyBinding { keys: @keys(Control+C); activated => { root.copy(); } }
                 KeyBinding { keys: @keys(Control+S); activated => { root.save(); } }
+                // 极简模式切换 / Esc 取消或退出
+                KeyBinding { keys: @keys(Control+M); activated => { root.toggle-minimal(); } }
+                KeyBinding { keys: @keys(Escape); activated => { root.escape-pressed(); } }
 
                 // 原图层
                 Image {
@@ -215,10 +228,33 @@ export component AppWindow inherits Window {
                     }
                 }
             }
+
+            // 极简模式提示条（画布左下角，半透明浮层；进入极简后 3 秒自动消失）
+            Rectangle {
+                visible: root.minimal-mode && root.minimal-tip-visible;
+                x: 14px;
+                y: canvas-area.height - 42px;
+                width: 400px;
+                height: 28px;
+                background: rgba(255, 255, 255, 0.85);
+                border-radius: 6px;
+                border-width: 1px;
+                border-color: #E0E0E0;
+                Text {
+                    x: 12px;
+                    vertical-alignment: center;
+                    width: 380px;
+                    height: 100%;
+                    text: root.minimal-tip;
+                    font-size: 12px;
+                    color: #757575;
+                }
+            }
         }
 
-        // ---- 状态栏 ----
+        // ---- 状态栏（极简模式隐藏）----
         HorizontalLayout {
+            visible: !root.minimal-mode;
             Rectangle {
                 height: 32px;
                 background: #FFFFFF;
