@@ -13,6 +13,7 @@ mod workspace;
 use canvas::{Annotation, AnnotationStore, Tool, ViewTransform};
 use slint::{Image, Rgba8Pixel, SharedPixelBuffer, SharedString, Timer, TimerMode};
 use std::cell::RefCell;
+use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
@@ -353,35 +354,84 @@ struct LoadResult {
     decoded: Result<(u32, u32, Vec<u8>), String>,
 }
 
-/// 发起异步加载：主线程同步持久化旧标注并提示，后台线程解码，结果入队由主线程轮询应用
+/// 解码完成的图片数据（缓存单元）
+struct Decoded {
+    w: u32,
+    h: u32,
+    rgba: Vec<u8>,
+}
+
+/// 后台预解码一张邻图写入缓存（切图秒开的关键）
+fn spawn_prefetch(idx: usize, files: Vec<String>, cache: &Arc<Mutex<HashMap<usize, Arc<Decoded>>>>) {
+    if idx >= files.len() {
+        return;
+    }
+    let cache = cache.clone();
+    std::thread::spawn(move || {
+        if cache.lock().map(|c| c.contains_key(&idx)).unwrap_or(true) {
+            return;
+        }
+        if let Some(path) = files.get(idx) {
+            if let Ok((w, h, rgba)) = canvas::decode_image(path) {
+                if let Ok(mut c) = cache.lock() {
+                    c.entry(idx).or_insert_with(|| Arc::new(Decoded { w, h, rgba }));
+                }
+            }
+        }
+    });
+}
+
+/// 发起异步加载：命中预取缓存则立即应用；否则后台解码
+/// 同时预取相邻图片到缓存
 fn load_image_by_index(
     app: &AppWindow,
     state: &Rc<RefCell<AppState>>,
     idx: usize,
     load_seq: &Arc<AtomicU32>,
     queue: &Arc<Mutex<Vec<LoadResult>>>,
+    cache: &Arc<Mutex<HashMap<usize, Arc<Decoded>>>>,
 ) {
-    let mut st = state.borrow_mut();
-    if idx >= st.files.len() {
-        return;
-    }
-    // 同步：持久化旧标注 + 清理交互状态 + 提示加载中
-    persist_current(&mut st);
-    st.interaction = Interaction::None;
-    hide_previews(app);
-    hide_text_input(app);
-    app.set_status(SharedString::from("加载中…"));
+    // 阶段 1（借用 state）：持久化旧标注 + 清理 + 快照
+    let (path, workspace_id, current_index) = {
+        let mut st = state.borrow_mut();
+        if idx >= st.files.len() {
+            return;
+        }
+        persist_current(&mut st);
+        st.interaction = Interaction::None;
+        hide_previews(app);
+        hide_text_input(app);
+        app.set_status(SharedString::from("加载中…"));
+        (st.files[idx].clone(), st.workspace_id, idx as i64)
+    };
 
-    // 快照线程所需数据
-    let path = st.files[idx].clone();
-    let workspace_id = st.workspace_id;
-    let current_index = idx as i64;
-    drop(st);
-
-    // 递增序号，本次任务为最新
+    // 递增序号（本次为最新，旧任务结果将被丢弃）
     let this_seq = load_seq.fetch_add(1, Ordering::Relaxed) + 1;
 
-    // 后台线程：仅解码（Send 数据），结果入队
+    // 缓存命中：立即应用（无需线程等待）
+    let cached = cache.lock().ok().and_then(|c| c.get(&idx).cloned());
+    if let Some(dec) = cached {
+        apply_load_result(
+            app,
+            state,
+            LoadResult {
+                seq: this_seq,
+                current_index,
+                path,
+                workspace_id,
+                decoded: Ok((dec.w, dec.h, dec.rgba.clone())),
+            },
+        );
+        // 命中后仍预取相邻图片
+        let files = state.borrow().files.clone();
+        spawn_prefetch(idx + 1, files.clone(), cache);
+        if idx > 0 {
+            spawn_prefetch(idx - 1, files, cache);
+        }
+        return;
+    }
+
+    // 未命中：后台解码，结果入队（轮询线程应用）
     let queue = queue.clone();
     std::thread::spawn(move || {
         let decoded = canvas::decode_image(&path).map_err(|e| e.to_string());
@@ -390,6 +440,22 @@ fn load_image_by_index(
             q.push(result);
         }
     });
+
+    // 缓存维护：只保留 idx 附近（±1），预取相邻图片
+    {
+        if let Ok(mut c) = cache.lock() {
+            let keep = idx as isize;
+            c.retain(|k, _| {
+                let k = *k as isize;
+                (k - keep).abs() <= 1
+            });
+        }
+    }
+    let files = state.borrow().files.clone();
+    spawn_prefetch(idx + 1, files.clone(), cache);
+    if idx > 0 {
+        spawn_prefetch(idx - 1, files, cache);
+    }
 }
 
 /// 应用一次加载结果（主线程 Timer 轮询队列时调用）
@@ -445,7 +511,12 @@ fn apply_load_result(app: &AppWindow, state: &Rc<RefCell<AppState>>, r: LoadResu
 /// 重渲染标注层（仅已完成的图元）并推到 Slint
 /// 同时同步文字标注列表到 Slint 显示层（撤销/新增后调用）
 fn update_overlay(app: &AppWindow, state: &AppState) {
-    if let Some((w, h, bytes)) = canvas::overlay::render_overlay(
+    if state.store.items.is_empty() {
+        // 无标注：置 1x1 透明 overlay，避免全图重建/上传
+        let mut tiny = SharedPixelBuffer::<Rgba8Pixel>::new(1, 1);
+        tiny.make_mut_bytes().copy_from_slice(&[0, 0, 0, 0]);
+        app.set_overlay_image(Image::from_rgba8(tiny));
+    } else if let Some((w, h, bytes)) = canvas::overlay::render_overlay(
         state.image_width,
         state.image_height,
         &state.store,
@@ -510,9 +581,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 2. 窗口
     let app = AppWindow::new()?;
     let state = Rc::new(RefCell::new(AppState::new()));
-    // 异步切图：序号（edition2024 中 gen 是保留字）+ 完成队列
+    // 异步切图：序号（edition2024 中 gen 是保留字）+ 完成队列 + 邻图预取缓存
     let load_seq = Arc::new(AtomicU32::new(0));
     let load_queue: Arc<Mutex<Vec<LoadResult>>> = Arc::new(Mutex::new(Vec::new()));
+    let decode_cache: Arc<Mutex<HashMap<usize, Arc<Decoded>>>> =
+        Arc::new(Mutex::new(HashMap::new()));
 
     // 3. 命令行参数：目录 → 工作目录模式；文件 → 单图模式
     if let Some(arg) = std::env::args().nth(1) {
@@ -532,7 +605,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             // 自动加载第一张（异步）
             let count = state.borrow().files.len();
             if count > 0 {
-                load_image_by_index(&app, &state, 0, &load_seq, &load_queue);
+                load_image_by_index(&app, &state, 0, &load_seq, &load_queue, &decode_cache);
             } else {
                 app.set_workspace_title(SharedString::from(title));
             }
@@ -797,13 +870,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let state = state.clone();
         let load_seq = load_seq.clone();
         let load_queue = load_queue.clone();
+        let decode_cache = decode_cache.clone();
         app.on_select_file(move || {
             let Some(app) = weak.upgrade() else {
                 return;
             };
             let idx = app.get_clicked_file();
             if idx >= 0 {
-                load_image_by_index(&app, &state, idx as usize, &load_seq, &load_queue);
+                load_image_by_index(
+                    &app,
+                    &state,
+                    idx as usize,
+                    &load_seq,
+                    &load_queue,
+                    &decode_cache,
+                );
             }
         });
     }
