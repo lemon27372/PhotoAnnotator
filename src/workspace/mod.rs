@@ -5,5 +5,5 @@
 pub mod scan;
 pub mod thumb;
 
-pub use scan::scan_images;
+pub use scan::{scan_images, scan_subdirs};
 pub use thumb::gen_thumbnail_png;

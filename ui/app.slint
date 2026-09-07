@@ -1,6 +1,6 @@
 // PhotoAnnotator 主窗口（第二阶段：图片加载 + 视图交互 + 矩形标注）
 // 预览矩形用原生元素实时显示（拖动流畅），完成后并入标注层位图
-import { Button, ListView } from "std-widgets.slint";
+import { Button, ListView, ScrollView } from "std-widgets.slint";
 
 /// 单行文字输入组件：FocusScope + 内建 TextInput（支持中文 IME）
 /// 相比 std LineEdit 可通过 forward-focus 编程聚焦（显示即输入，无需二次点击）
@@ -40,14 +40,121 @@ export struct TextDisplay {
     font-size: float,
 }
 
-/// 工作目录文件列表项
+/// 工作目录文件列表项（列表/网格共用；网格占位项 kind=-1）
 export struct FileEntry {
     path: string,
     name: string,
-    // 状态：0=未处理 1=已标注 2=已忽略
+    // 类型：0=图片 1=子目录 -1=网格行空占位
+    kind: int,
+    // 状态：0=未处理 1=已标注 2=已忽略（图片）
     status: int,
     // 缩略图（Rust 端解码为 Slint Image）
     thumb: image,
+}
+
+/// 网格视图行：固定 3 格（不足用 kind=-1 占位）
+export struct GridRow {
+    c0: FileEntry,
+    c1: FileEntry,
+    c2: FileEntry,
+}
+
+/// 最近工作区列表项
+export struct RecentEntry {
+    name: string,
+    path: string,
+}
+
+/// 侧边栏小按钮（视图切换 / 最近）
+component SideBtn {
+    in property <string> label;
+    in property <bool> active;
+    callback clicked;
+    min-width: 30px;
+    height: 18px;
+    Rectangle {
+        width: 100%;
+        height: 100%;
+        border-radius: 4px;
+        background: root.active ? #4A90D9 : transparent;
+        border-width: 1px;
+        border-color: root.active ? #4A90D9 : #BDBDBD;
+        Text {
+            width: 100%;
+            height: 100%;
+            horizontal-alignment: center;
+            vertical-alignment: center;
+            text: root.label;
+            font-size: 10px;
+            color: root.active ? #FFFFFF : #757575;
+        }
+        TouchArea {
+            clicked => { root.clicked(); }
+        }
+    }
+}
+
+/// 网格视图单元格（3 列固定；kind=-1 为空占位，不可交互）
+component GridCell {
+    in property <FileEntry> entry;
+    in property <int> gidx;
+    in property <int> current-row: -1;
+    callback clicked;
+    width: 58px;
+    height: 68px;
+    Rectangle {
+        width: 100%;
+        height: 100%;
+        border-radius: 4px;
+        background: root.entry.kind == -1 ? transparent
+            : root.gidx == root.current-row ? #E3EDF8
+            : root.entry.kind == 1 ? #EFF4FB : transparent;
+        TouchArea {
+            enabled: root.entry.kind >= 0;
+            clicked => { root.clicked(); }
+        }
+        VerticalLayout {
+            width: 100%;
+            height: 100%;
+            alignment: center;
+            spacing: 2px;
+            // 缩略图 / 目录图标位（占位格透明空位；kind 互斥，用独立 if）
+            if root.entry.kind == 0: Image {
+                width: 44px;
+                height: 32px;
+                source: root.entry.thumb;
+                image-fit: contain;
+            }
+            if root.entry.kind == 1: Rectangle {
+                width: 44px;
+                height: 32px;
+                background: #D6E6F8;
+                border-radius: 4px;
+                Text {
+                    width: 100%;
+                    height: 100%;
+                    horizontal-alignment: center;
+                    vertical-alignment: center;
+                    text: "▸";
+                    font-size: 16px;
+                    color: #4A90D9;
+                }
+            }
+            if root.entry.kind == -1: Rectangle {
+                width: 44px;
+                height: 32px;
+            }
+            // 名称
+            Text {
+                width: 52px;
+                text: root.entry.name;
+                font-size: 10px;
+                color: root.entry.kind == 1 ? #4A90D9 : #212121;
+                overflow: elide;
+                horizontal-alignment: center;
+            }
+        }
+    }
 }
 
 export component AppWindow inherits Window {
@@ -112,11 +219,30 @@ export component AppWindow inherits Window {
     // ---- 工作目录（第三阶段）----
     in-out property <string> workspace-title: "未打开工作目录";
     in-out property <[FileEntry]> file-list: [];
-    // 当前选中图片索引（-1 = 无）
+    // 网格视图行模型（列表/网格共用同一数据源，Rust 端同步维护）
+    in-out property <[GridRow]> grid-rows: [];
+    // 视图：0=列表 1=网格
+    in-out property <int> view-mode: 0;
+    // 当前选中条目行号（列表=行号，网格=全局条目序号；-1 = 无）
+    in-out property <int> current-row: -1;
+    // 当前图片索引（图片在 files 中的位置；-1 = 无）
     in-out property <int> current-index: -1;
     // 列表点击项索引（属性传值，规避带参 callback 解析问题）
     in-out property <int> clicked-file: -1;
     callback select-file;
+    // 面包屑：各级目录显示名（可点击导航）
+    in-out property <[string]> crumb-list: [];
+    in-out property <int> clicked-crumb: -1;
+    callback crumb-clicked;
+    // 最近工作区（面板 overlay）
+    in-out property <bool> recent-visible: false;
+    in-out property <[RecentEntry]> recent-list: [];
+    in-out property <int> clicked-recent: -1;
+    callback recent-selected;
+    // 「最近」按钮：Rust 端拉取列表并切换面板显隐
+    callback open-recent;
+    // 侧边栏信息（图/目录计数）
+    in-out property <string> sidebar-meta: "";
     // 切图加载中（画布中央浮层）
     in-out property <bool> loading: false;
 
@@ -209,36 +335,115 @@ export component AppWindow inherits Window {
                 border-radius: 6px;
                 border-width: 1px;
                 border-color: #E0E0E0;
+                clip: true;
 
                 VerticalLayout {
                     padding: 6px;
                     spacing: 4px;
-                    // 目录标题
-                    Text {
-                        text: root.workspace-title;
-                        font-size: 13px;
-                        font-weight: 600;
-                        color: #212121;
-                        overflow: elide;
+
+                    // 行1：目录标题 + 计数 + 最近按钮
+                    HorizontalLayout {
+                        height: 20px;
+                        spacing: 6px;
+                        Text {
+                            text: root.workspace-title;
+                            font-size: 12px;
+                            font-weight: 600;
+                            color: #212121;
+                            overflow: elide;
+                            vertical-alignment: center;
+                            horizontal-stretch: 1;
+                        }
+                        Text {
+                            text: root.sidebar-meta;
+                            font-size: 10px;
+                            color: #757575;
+                            vertical-alignment: center;
+                        }
+                        SideBtn {
+                            label: "最近";
+                            active: root.recent-visible;
+                            clicked => { root.open-recent(); }
+                        }
+                    }
+                    // 行2：面包屑（可点击导航）+ 列表/网格切换
+                    HorizontalLayout {
+                        height: 20px;
+                        spacing: 4px;
+                        // 面包屑（仅多于一级时显示；末级为当前目录）
+                        HorizontalLayout {
+                            visible: root.crumb-list.length > 1;
+                            horizontal-stretch: 1;
+                            for crumb[idx] in root.crumb-list: HorizontalLayout {
+                                Rectangle {
+                                    height: 18px;
+                                    TouchArea {
+                                        clicked => {
+                                            root.clicked-crumb = idx;
+                                            root.recent-visible = false;
+                                            root.crumb-clicked();
+                                            canvas-fs.focus();
+                                        }
+                                    }
+                                    VerticalLayout {
+                                        width: 100%;
+                                        height: 100%;
+                                        alignment: center;
+                                        Text {
+                                            text: crumb;
+                                            font-size: 11px;
+                                            color: idx == root.crumb-list.length - 1 ? #212121 : #4A90D9;
+                                            font-weight: idx == root.crumb-list.length - 1 ? 600 : 400;
+                                        }
+                                    }
+                                }
+                                if idx < root.crumb-list.length - 1: Text {
+                                    height: 18px;
+                                    vertical-alignment: center;
+                                    text: "/";
+                                    font-size: 11px;
+                                    color: #BDBDBD;
+                                }
+                            }
+                        }
+                        Rectangle { width: 4px; }
+                        SideBtn {
+                            label: "列表";
+                            active: root.view-mode == 0;
+                            clicked => {
+                                root.view-mode = 0;
+                                root.recent-visible = false;
+                            }
+                        }
+                        SideBtn {
+                            label: "网格";
+                            active: root.view-mode == 1;
+                            clicked => {
+                                root.view-mode = 1;
+                                root.recent-visible = false;
+                            }
+                        }
                     }
                     Rectangle {
                         height: 1px;
                         background: #E0E0E0;
                     }
-                    // 图片列表（虚拟化；点击加载到画布）
+
+                    // ---- 列表视图（虚拟化；单击图=切图，双击目录=进入）----
                     ListView {
                         vertical-stretch: 1;
+                        visible: root.view-mode == 0;
                         for entry[idx] in root.file-list: Rectangle {
                             height: 46px;
                             border-radius: 4px;
-                            background: idx == root.current-index ? #E3EDF8 : transparent;
+                            background: idx == root.current-row ? #E3EDF8 : transparent;
                             TouchArea {
                                 clicked => {
                                     root.clicked-file = idx;
                                     root.select-file();
                                     canvas-fs.focus();
                                 }
-                                // 内容垂直居中（行高 46，内容高 30）
+                                // 内容垂直居中（行高 46）
                                 VerticalLayout {
                                     width: 100%;
                                     height: 100%;
@@ -246,29 +451,117 @@ export component AppWindow inherits Window {
                                     HorizontalLayout {
                                         padding-left: 6px;
                                         padding-right: 6px;
-                                        spacing: 8px;
-                                        // 缩略图
-                                        Image {
+                                        spacing: 6px;
+                                        // 子目录前缀符号（无缩略图）
+                                        if entry.kind == 1: Text {
+                                            width: 14px;
+                                            text: "▸";
+                                            font-size: 13px;
+                                            color: #4A90D9;
+                                        }
+                                        // 图片缩略图
+                                        if entry.kind == 0: Image {
                                             width: 40px;
                                             height: 30px;
                                             source: entry.thumb;
                                             image-fit: contain;
                                         }
-                                        // 文件名
+                                        // 名称（目录蓝色）
                                         Text {
                                             height: 100%;
                                             vertical-alignment: center;
                                             text: entry.name;
                                             font-size: 12px;
-                                            color: #212121;
+                                            color: entry.kind == 1 ? #4A90D9 : #212121;
                                             overflow: elide;
                                         }
-                                        // 状态点（0 未处理灰 / 1 已标注蓝 / 2 已忽略浅灰）
+                                        // 状态点（0 未处理灰 / 1 已标注蓝 / 2 已忽略浅灰；仅图片）
                                         Rectangle {
+                                            visible: entry.kind == 0;
                                             width: 8px;
                                             height: 8px;
                                             border-radius: 4px;
                                             background: entry.status == 1 ? #4A90D9 : entry.status == 2 ? #BDBDBD : #9E9E9E;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    // ---- 网格视图（非虚拟化：3 列缩略图，ScrollView 滚动）----
+                    ScrollView {
+                        vertical-stretch: 1;
+                        visible: root.view-mode == 1;
+                        GridLayout {
+                            spacing: 6px;
+                            padding: 4px;
+                            for row[ri] in root.grid-rows: Row {
+                                GridCell { entry: row.c0; gidx: ri * 3 + 0; current-row: root.current-row; clicked => { root.clicked-file = self.gidx; root.select-file(); canvas-fs.focus(); } }
+                                GridCell { entry: row.c1; gidx: ri * 3 + 1; current-row: root.current-row; clicked => { root.clicked-file = self.gidx; root.select-file(); canvas-fs.focus(); } }
+                                GridCell { entry: row.c2; gidx: ri * 3 + 2; current-row: root.current-row; clicked => { root.clicked-file = self.gidx; root.select-file(); canvas-fs.focus(); } }
+                            }
+                        }
+                    }
+                }
+
+                // 最近工作区浮层面板（绝对定位盖在列表区上；声明在布局后 → z 序在上层）
+                recent-panel := Rectangle {
+                    visible: root.recent-visible;
+                    x: 3px;
+                    y: 58px;
+                    width: workspace-side.width - 6px;
+                    height: min(root.recent-list.length * 34px + 46px, workspace-side.height - 66px);
+                    background: #FFFFFF;
+                    border-radius: 6px;
+                    border-width: 1px;
+                    border-color: #4A90D9;
+                    VerticalLayout {
+                        padding: 6px;
+                        spacing: 2px;
+                        Text {
+                            text: "最近工作区";
+                            font-size: 11px;
+                            font-weight: 600;
+                            color: #212121;
+                        }
+                        if root.recent-list.length == 0: Text {
+                            text: "（暂无最近工作区）";
+                            font-size: 11px;
+                            color: #9E9E9E;
+                        }
+                        ListView {
+                            vertical-stretch: 1;
+                            for r[idx] in root.recent-list: Rectangle {
+                                height: 32px;
+                                border-radius: 4px;
+                                TouchArea {
+                                    clicked => {
+                                        root.clicked-recent = idx;
+                                        root.recent-selected();
+                                        canvas-fs.focus();
+                                    }
+                                    VerticalLayout {
+                                        width: 100%;
+                                        height: 100%;
+                                        alignment: center;
+                                        HorizontalLayout {
+                                            width: 100%;
+                                            padding-left: 4px;
+                                            padding-right: 4px;
+                                            spacing: 6px;
+                                            Text {
+                                                text: r.name;
+                                                font-size: 12px;
+                                                color: #212121;
+                                                overflow: elide;
+                                            }
+                                            Text {
+                                                text: r.path;
+                                                font-size: 10px;
+                                                color: #9E9E9E;
+                                                overflow: elide;
+                                            }
                                         }
                                     }
                                 }

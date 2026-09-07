@@ -79,6 +79,24 @@ pub fn touch_workspace(path: &str) -> Option<i64> {
     conn.query_row("SELECT id FROM workspaces WHERE path = ?1", [path], |r| r.get(0)).ok()
 }
 
+/// 最近工作区列表（按最后打开时间倒序，limit 条）
+/// 返回 (workspace id, 路径, last_opened)
+pub fn list_workspaces(limit: i64) -> Vec<(i64, String, i64)> {
+    let conn = match open() {
+        Ok(c) => c,
+        Err(_) => return Vec::new(),
+    };
+    let mut stmt = match conn
+        .prepare("SELECT id, path, last_opened FROM workspaces ORDER BY last_opened DESC LIMIT ?1")
+    {
+        Ok(s) => s,
+        Err(_) => return Vec::new(),
+    };
+    stmt.query_map([limit], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+        .map(|rows| rows.flatten().collect())
+        .unwrap_or_default()
+}
+
 /// 记录文件索引（含状态），返回 file id（幂等 upsert）
 pub fn upsert_file(workspace_id: i64, path: &str, width: i32, height: i32) -> Option<i64> {
     let conn = open().ok()?;

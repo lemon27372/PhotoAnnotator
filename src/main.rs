@@ -11,7 +11,7 @@ mod storage;
 mod workspace;
 
 use canvas::{Annotation, AnnotationStore, Tool, ViewTransform};
-use slint::{Image, Rgba8Pixel, SharedPixelBuffer, SharedString, Timer, TimerMode};
+use slint::{Image, Model, Rgba8Pixel, SharedPixelBuffer, SharedString, Timer, TimerMode};
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
@@ -179,10 +179,14 @@ struct AppState {
     /// 原图 straight-alpha RGBA（合成导出用）
     image_rgba: Vec<u8>,
     // ---- 工作目录（第三阶段）----
-    /// 当前工作目录
+    /// 工作区根目录（nav_stack[0] 同义；决定 workspace_id 与标题）
     workspace_dir: Option<String>,
     /// DB workspace id（-1 = 单图模式未开工作区）
     workspace_id: i64,
+    /// 面包屑导航栈（根在前，当前浏览目录 = last）
+    nav_stack: Vec<String>,
+    /// 当前浏览目录的直接子目录（扫描结果，排序）
+    dirs: Vec<String>,
     /// 当前目录图片绝对路径列表
     files: Vec<String>,
     /// 每张图的 DB file id
@@ -191,8 +195,11 @@ struct AppState {
     current_index: i64,
     /// 当前图片 DB file id（-1 = 未入库）
     file_id: i64,
-    /// 缩略图内存缓存（解码一次，重建列表复用）
+    /// 缩略图内存缓存（按 files 图片索引；解码一次，重建列表复用）
     thumb_cache: Vec<Option<slint::Image>>,
+    /// 双击检测：上一次点击的列表行（-1 无）与时刻（ns）
+    last_click_row: i32,
+    last_click_at: u128,
 }
 
 impl AppState {
@@ -206,11 +213,15 @@ impl AppState {
             image_rgba: Vec::new(),
             workspace_dir: None,
             workspace_id: -1,
+            nav_stack: Vec::new(),
+            dirs: Vec::new(),
             files: Vec::new(),
             file_ids: Vec::new(),
             current_index: -1,
             file_id: -1,
             thumb_cache: Vec::new(),
+            last_click_row: -1,
+            last_click_at: 0,
         }
     }
 }
@@ -273,17 +284,47 @@ fn ensure_thumbnail(st: &mut AppState, idx: usize) -> Option<Image> {
     img
 }
 
-/// 重建侧边栏列表 model（状态 + 缩略图）
-fn rebuild_file_list(app: &AppWindow, st: &mut AppState) {
-    // 先收集各文件元信息，避免借用冲突
-    let meta: Vec<(String, String, i32)> = st
+/// 当前浏览目录（面包屑栈顶；无工作区时 None）
+fn current_dir(st: &AppState) -> Option<&str> {
+    st.nav_stack.last().map(|s| s.as_str())
+}
+
+/// 路径显示名（末段；盘符根回退整串）
+fn dir_display_name(path: &str) -> String {
+    std::path::Path::new(path)
+        .file_name()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| path.to_string())
+}
+
+/// 当前图片在侧边栏列表中的行号（目录行在前 → 需偏移；-1 = 无选中图）
+fn current_row(st: &AppState) -> i32 {
+    if st.current_index >= 0 {
+        st.dirs.len() as i32 + st.current_index as i32
+    } else {
+        -1
+    }
+}
+
+/// 空占位条目（网格行末尾补齐，kind=-1 不可交互）
+fn placeholder_entry() -> FileEntry {
+    FileEntry {
+        path: SharedString::new(),
+        name: SharedString::new(),
+        kind: -1,
+        status: 0,
+        thumb: Image::default(),
+    }
+}
+
+/// 重建侧边栏：file-list（子目录行 + 图片行）+ grid-rows（每行 3 格）+ 面包屑 + 计数 + 当前行高亮
+fn rebuild_sidebar(app: &AppWindow, st: &mut AppState) {
+    // 1. 图片行元信息（借用分离，避免冲突）
+    let imgs: Vec<(String, String, i32)> = st
         .files
         .iter()
         .map(|path| {
-            let name = std::path::Path::new(path)
-                .file_name()
-                .map(|s| s.to_string_lossy().into_owned())
-                .unwrap_or_else(|| path.clone());
+            let name = dir_display_name(path);
             let status = if st.workspace_id >= 0 {
                 match storage::db::file_status(st.workspace_id, path).as_str() {
                     "done" => 1,
@@ -297,29 +338,83 @@ fn rebuild_file_list(app: &AppWindow, st: &mut AppState) {
         })
         .collect();
 
-    let mut entries: Vec<FileEntry> = Vec::with_capacity(meta.len());
-    for (i, (path, name, status)) in meta.into_iter().enumerate() {
+    let mut entries: Vec<FileEntry> = Vec::with_capacity(st.dirs.len() + imgs.len());
+    // 子目录行（kind=1，无缩略图；列在图片之前 → 行号前缀即 dirs.len()）
+    for d in &st.dirs {
+        entries.push(FileEntry {
+            path: d.clone().into(),
+            name: dir_display_name(d).into(),
+            kind: 1,
+            status: 0,
+            thumb: Image::default(),
+        });
+    }
+    // 图片行（kind=0）
+    for (i, (path, name, status)) in imgs.into_iter().enumerate() {
         let thumb = ensure_thumbnail(st, i).unwrap_or_default();
         entries.push(FileEntry {
             path: path.into(),
             name: name.into(),
+            kind: 0,
             status,
             thumb,
         });
     }
-    app.set_file_list(slint::ModelRc::from(Rc::new(slint::VecModel::from(entries))));
+    app.set_file_list(slint::ModelRc::from(Rc::new(slint::VecModel::from(entries.clone()))));
+
+    // 2. 网格行（固定 3 格，不足补占位）
+    let rows: Vec<GridRow> = entries
+        .chunks(3)
+        .map(|c| GridRow {
+            c0: c[0].clone(),
+            c1: c.get(1).cloned().unwrap_or_else(placeholder_entry),
+            c2: c.get(2).cloned().unwrap_or_else(placeholder_entry),
+        })
+        .collect();
+    app.set_grid_rows(slint::ModelRc::from(Rc::new(slint::VecModel::from(rows))));
+
+    // 3. 面包屑（各级显示名；仅多级时可见）
+    let crumbs: Vec<SharedString> = st
+        .nav_stack
+        .iter()
+        .map(|d| dir_display_name(d).into())
+        .collect();
+    app.set_crumb_list(slint::ModelRc::from(Rc::new(slint::VecModel::from(crumbs))));
+
+    // 4. 计数信息
+    let meta = if st.dirs.is_empty() && st.files.is_empty() {
+        "空".to_string()
+    } else {
+        let mut parts = Vec::new();
+        if !st.dirs.is_empty() {
+            parts.push(format!("{} 目录", st.dirs.len()));
+        }
+        if !st.files.is_empty() {
+            parts.push(format!("{} 图", st.files.len()));
+        }
+        parts.join(" · ")
+    };
+    app.set_sidebar_meta(SharedString::from(meta));
+
+    // 5. 当前选中行高亮（目录切换后重算）
+    app.set_current_row(current_row(st));
 }
 
-/// 打开工作目录：扫描 + 入库索引 + 重建列表
-fn open_workspace(app: &AppWindow, st: &mut AppState, dir: &str) {
-    persist_current(st);
-    let dir_path = std::path::Path::new(dir);
+/// 按当前浏览目录（nav_stack 栈顶）重新扫描：dirs + files + file_ids + 缓存重置
+/// （不触碰 workspace_id / 根目录；标注持久化由调用方负责）
+fn rescan_current(app: &AppWindow, st: &mut AppState) {
+    let Some(dir) = current_dir(st).map(str::to_string) else {
+        return;
+    };
+    let dir_path = std::path::Path::new(&dir);
+    st.dirs = workspace::scan_subdirs(dir_path)
+        .iter()
+        .map(|p| p.to_string_lossy().into_owned())
+        .collect();
     st.files = workspace::scan_images(dir_path)
         .iter()
         .map(|p| p.to_string_lossy().into_owned())
         .collect();
-    st.workspace_dir = Some(dir.to_string());
-    st.workspace_id = storage::db::touch_workspace(dir).unwrap_or(-1);
     st.thumb_cache = Vec::new();
     st.current_index = -1;
     st.file_id = -1;
@@ -327,19 +422,25 @@ fn open_workspace(app: &AppWindow, st: &mut AppState, dir: &str) {
     // 入库获取 file id（宽高暂 0，打开时更新）
     if st.workspace_id >= 0 {
         for p in &st.files {
-            st.file_ids.push(storage::db::upsert_file(st.workspace_id, p, 0, 0).unwrap_or(-1));
+            st.file_ids
+                .push(storage::db::upsert_file(st.workspace_id, p, 0, 0).unwrap_or(-1));
         }
     }
-    let title = dir_path
-        .file_name()
-        .map(|s| s.to_string_lossy().into_owned())
-        .unwrap_or_else(|| dir.to_string());
-    app.set_workspace_title(SharedString::from(title));
-    rebuild_file_list(app, st);
     app.set_current_index(-1);
-    if st.files.is_empty() {
-        app.set_status(SharedString::from(format!("{dir} 中没有支持的图片")));
+    rebuild_sidebar(app, st);
+    if st.dirs.is_empty() && st.files.is_empty() {
+        app.set_status(SharedString::from(format!("{dir} 为空（无子目录/图片）")));
     }
+}
+
+/// 打开工作目录（切换工作区根）：persist + 重置导航栈 + 扫描 + 重建列表
+fn open_workspace(app: &AppWindow, st: &mut AppState, dir: &str) {
+    persist_current(st);
+    st.workspace_dir = Some(dir.to_string());
+    st.workspace_id = storage::db::touch_workspace(dir).unwrap_or(-1);
+    st.nav_stack = vec![dir.to_string()];
+    rescan_current(app, st);
+    app.set_workspace_title(SharedString::from(dir_display_name(dir)));
 }
 
 /// 后台解码完成的结果（Send，可跨线程排队）
@@ -503,6 +604,7 @@ fn apply_load_result(app: &AppWindow, state: &Rc<RefCell<AppState>>, r: LoadResu
     }
     update_overlay(app, &st);
     app.set_current_index(r.current_index as i32);
+    app.set_current_row(current_row(&st));
     app.set_fit_mode(true);
     app.set_loading(false);
     let name = std::path::Path::new(&r.path)
@@ -599,22 +701,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let arg_path = std::path::Path::new(&arg);
         if arg_path.is_dir() {
             // 工作目录模式：打开目录并加载第一张
-            let title = arg_path
-                .file_name()
-                .map(|s| s.to_string_lossy().into_owned())
-                .unwrap_or_else(|| arg.clone());
             println!("[workspace] 打开工作目录: {arg}");
             {
                 let mut st = state.borrow_mut();
                 open_workspace(&app, &mut st, &arg);
-                st.workspace_dir = Some(arg.clone());
             }
             // 自动加载第一张（异步）
             let count = state.borrow().files.len();
             if count > 0 {
                 load_image_by_index(&app, &state, 0, &load_seq, &load_queue, &decode_cache);
-            } else {
-                app.set_workspace_title(SharedString::from(title));
             }
         } else {
             // 单图模式
@@ -737,7 +832,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         if let Some(p) = st.image_path.clone() {
                             storage::db::set_file_status(st.workspace_id, &p, "done");
                             persist_current(&mut st);
-                            rebuild_file_list(&app, &mut st);
+                            rebuild_sidebar(&app, &mut st);
                         }
                     }
                     app.set_status(SharedString::from(format!(
@@ -796,28 +891,31 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         });
     }
     {
-        // Esc 层级处理：取消文字输入 > 取消绘制 > 退出极简模式 > 提示
+        // Esc 层级处理：关最近面板 > 取消文字输入 > 取消绘制 > 退出极简模式 > 提示
         let weak = app.as_weak();
         let state = state.clone();
         app.on_escape_pressed(move || {
             let (Some(app), mut st) = (weak.upgrade(), state.borrow_mut()) else {
                 return;
             };
-            if app.get_text_input_visible() {
-                // 0. 文字输入中 → 取消输入
+            if app.get_recent_visible() {
+                // 0. 最近工作区面板打开 → 关闭
+                app.set_recent_visible(false);
+            } else if app.get_text_input_visible() {
+                // 1. 文字输入中 → 取消输入
                 hide_text_input(&app);
                 app.set_status(SharedString::from("已取消文字输入"));
             } else if !matches!(st.interaction, Interaction::None) {
-                // 1. 有绘制/平移进行中 → 取消
+                // 2. 有绘制/平移进行中 → 取消
                 st.interaction = Interaction::None;
                 hide_previews(&app);
                 app.set_status(SharedString::from("已取消"));
             } else if app.get_minimal_mode() {
-                // 2. 极简模式且无绘制 → 退出极简
+                // 3. 极简模式且无绘制 → 退出极简
                 app.set_minimal_mode(false);
                 app.set_status(SharedString::from("已退出极简模式"));
             } else {
-                // 3. 完整模式无操作 → 提示入口
+                // 4. 完整模式无操作 → 提示入口
                 app.set_status(SharedString::from("极简模式: Ctrl+M"));
             }
         });
@@ -872,7 +970,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         });
     }
     {
-        // 侧边栏点击：加载所选图片（异步，先持久化旧标注）
+        // 侧边栏点击（列表/网格共用行号）：
+        //   子目录行 → 双击进入（单击仅提示）；图片行 → 异步加载（先持久化旧标注）
         let weak = app.as_weak();
         let state = state.clone();
         let load_seq = load_seq.clone();
@@ -882,16 +981,146 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let Some(app) = weak.upgrade() else {
                 return;
             };
-            let idx = app.get_clicked_file();
-            if idx >= 0 {
-                load_image_by_index(
-                    &app,
-                    &state,
-                    idx as usize,
-                    &load_seq,
-                    &load_queue,
-                    &decode_cache,
-                );
+            let row = app.get_clicked_file();
+            if row < 0 {
+                return;
+            }
+            let mut st = state.borrow_mut();
+            // 双击判定（同行 500ms 内）
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0);
+            let is_double = row == st.last_click_row
+                && st.last_click_at != 0
+                && now.saturating_sub(st.last_click_at) < 500_000_000;
+            st.last_click_row = row;
+            st.last_click_at = now;
+
+            let dir_count = st.dirs.len() as i32;
+            if row < dir_count {
+                // 子目录行
+                let Some(dir) = st.dirs.get(row as usize).cloned() else {
+                    return;
+                };
+                if !is_double {
+                    let name = dir_display_name(&dir);
+                    app.set_status(SharedString::from(format!("双击进入子目录: {name}")));
+                    return;
+                }
+                // 双击 → 进入子目录（持久化旧标注 + 重扫 + 加载首图）
+                persist_current(&mut st);
+                st.nav_stack.push(dir);
+                // 解码缓存按图片索引区分目录 → 目录变更时清空，防同索引命中旧目录图片
+                if let Ok(mut c) = decode_cache.lock() {
+                    c.clear();
+                }
+                rescan_current(&app, &mut st);
+                let count = st.files.len();
+                drop(st);
+                if count > 0 {
+                    load_image_by_index(&app, &state, 0, &load_seq, &load_queue, &decode_cache);
+                }
+            } else {
+                // 图片行（行号 - 目录数 = 图片索引）
+                let img_idx = (row - dir_count) as usize;
+                if img_idx >= st.files.len() {
+                    return;
+                }
+                drop(st);
+                load_image_by_index(&app, &state, img_idx, &load_seq, &load_queue, &decode_cache);
+            }
+        });
+    }
+    {
+        // 面包屑点击：跳转到对应层级目录（含当前层 no-op）
+        let weak = app.as_weak();
+        let state = state.clone();
+        let load_seq = load_seq.clone();
+        let load_queue = load_queue.clone();
+        let decode_cache = decode_cache.clone();
+        app.on_crumb_clicked(move || {
+            let Some(app) = weak.upgrade() else {
+                return;
+            };
+            let depth = app.get_clicked_crumb();
+            if depth < 0 {
+                return;
+            }
+            let mut st = state.borrow_mut();
+            let len = st.nav_stack.len();
+            let d = depth as usize;
+            if d >= len || d == len - 1 {
+                return; // 越界 / 已在该层
+            }
+            persist_current(&mut st);
+            st.nav_stack.truncate(d + 1);
+            if let Ok(mut c) = decode_cache.lock() {
+                c.clear();
+            }
+            rescan_current(&app, &mut st);
+            let count = st.files.len();
+            drop(st);
+            if count > 0 {
+                load_image_by_index(&app, &state, 0, &load_seq, &load_queue, &decode_cache);
+            }
+        });
+    }
+    {
+        // 「最近」按钮：打开时拉取最近工作区列表；已打开则关闭
+        let weak = app.as_weak();
+        app.on_open_recent(move || {
+            let Some(app) = weak.upgrade() else {
+                return;
+            };
+            if app.get_recent_visible() {
+                app.set_recent_visible(false);
+                return;
+            }
+            let list: Vec<RecentEntry> = storage::db::list_workspaces(10)
+                .into_iter()
+                // 目录已不存在的历史跳过
+                .filter(|(_, p, _)| std::path::Path::new(p).is_dir())
+                .take(8)
+                .map(|(_, p, _)| RecentEntry {
+                    name: dir_display_name(&p).into(),
+                    path: p.into(),
+                })
+                .collect();
+            app.set_recent_list(slint::ModelRc::from(Rc::new(slint::VecModel::from(list))));
+            app.set_recent_visible(true);
+        });
+    }
+    {
+        // 最近工作区条目点击：切换到该工作区（等同命令行打开目录）
+        let weak = app.as_weak();
+        let state = state.clone();
+        let load_seq = load_seq.clone();
+        let load_queue = load_queue.clone();
+        let decode_cache = decode_cache.clone();
+        app.on_recent_selected(move || {
+            let Some(app) = weak.upgrade() else {
+                return;
+            };
+            let idx = app.get_clicked_recent();
+            if idx < 0 {
+                return;
+            }
+            let entry = app.get_recent_list().row_data(idx as usize);
+            let Some(entry) = entry else {
+                return;
+            };
+            app.set_recent_visible(false);
+            let path = entry.path.to_string();
+            if let Ok(mut c) = decode_cache.lock() {
+                c.clear();
+            }
+            let mut st = state.borrow_mut();
+            open_workspace(&app, &mut st, &path);
+            let count = st.files.len();
+            drop(st);
+            if count > 0 {
+                load_image_by_index(&app, &state, 0, &load_seq, &load_queue, &decode_cache);
             }
         });
     }
