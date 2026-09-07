@@ -391,7 +391,7 @@ fn load_image_by_index(
     queue: &Arc<Mutex<Vec<LoadResult>>>,
     cache: &Arc<Mutex<HashMap<usize, Arc<Decoded>>>>,
 ) {
-    // 阶段 1（借用 state）：持久化旧标注 + 清理 + 快照
+    // 阶段 1（借用 state）：持久化旧标注 + 清理 + 提示加载中
     let (path, workspace_id, current_index) = {
         let mut st = state.borrow_mut();
         if idx >= st.files.len() {
@@ -401,6 +401,7 @@ fn load_image_by_index(
         st.interaction = Interaction::None;
         hide_previews(app);
         hide_text_input(app);
+        app.set_loading(true);
         app.set_status(SharedString::from("加载中…"));
         (st.files[idx].clone(), st.workspace_id, idx as i64)
     };
@@ -422,11 +423,13 @@ fn load_image_by_index(
                 decoded: Ok((dec.w, dec.h, dec.rgba.clone())),
             },
         );
-        // 命中后仍预取相邻图片
+        // 命中后仍预取相邻图片（±2）
         let files = state.borrow().files.clone();
-        spawn_prefetch(idx + 1, files.clone(), cache);
-        if idx > 0 {
-            spawn_prefetch(idx - 1, files, cache);
+        for off in [1i64, -1i64, 2i64, -2i64] {
+            let n = idx as i64 + off;
+            if n >= 0 {
+                spawn_prefetch(n as usize, files.clone(), cache);
+            }
         }
         return;
     }
@@ -441,20 +444,22 @@ fn load_image_by_index(
         }
     });
 
-    // 缓存维护：只保留 idx 附近（±1），预取相邻图片
+    // 缓存维护：只保留 idx 附近（±2），预取相邻图片
     {
         if let Ok(mut c) = cache.lock() {
             let keep = idx as isize;
             c.retain(|k, _| {
                 let k = *k as isize;
-                (k - keep).abs() <= 1
+                (k - keep).abs() <= 2
             });
         }
     }
     let files = state.borrow().files.clone();
-    spawn_prefetch(idx + 1, files.clone(), cache);
-    if idx > 0 {
-        spawn_prefetch(idx - 1, files, cache);
+    for off in [1i64, -1i64, 2i64, -2i64] {
+        let n = idx as i64 + off;
+        if n >= 0 {
+            spawn_prefetch(n as usize, files.clone(), cache);
+        }
     }
 }
 
@@ -464,6 +469,7 @@ fn apply_load_result(app: &AppWindow, state: &Rc<RefCell<AppState>>, r: LoadResu
     let (w, h, rgba) = match r.decoded {
         Ok(v) => v,
         Err(e) => {
+            app.set_loading(false);
             app.set_status(SharedString::from(format!("加载失败: {e}")));
             return;
         }
@@ -498,6 +504,7 @@ fn apply_load_result(app: &AppWindow, state: &Rc<RefCell<AppState>>, r: LoadResu
     update_overlay(app, &st);
     app.set_current_index(r.current_index as i32);
     app.set_fit_mode(true);
+    app.set_loading(false);
     let name = std::path::Path::new(&r.path)
         .file_name()
         .map(|s| s.to_string_lossy().into_owned())
