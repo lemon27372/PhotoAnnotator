@@ -37,7 +37,7 @@ pub const ARROW_STROKE_WIDTH: f32 = 5.0; // 箭头线宽（视觉上应比框粗
 pub const DEFAULT_FONT_SIZE: f32 = 24.0; // 文字标注字号（图片像素）
 
 /// 通用"框形"标注数据：外接矩形两点式（图片像素坐标）+ 样式
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct BoxShape {
     pub x1: f32,
     pub y1: f32,
@@ -67,7 +67,7 @@ impl BoxShape {
 }
 
 /// 线段类标注（箭头）：起点→终点（图片像素坐标）+ 样式
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct LineShape {
     pub x1: f32,
     pub y1: f32,
@@ -112,7 +112,7 @@ pub fn arrow_head_points(x1: f32, y1: f32, x2: f32, y2: f32, width: f32) -> Opti
 }
 
 /// 自由画笔标注：连续折线（图片像素坐标点序列）+ 样式
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct PenShape {
     pub points: Vec<(f32, f32)>,
     pub color: u32,
@@ -120,7 +120,7 @@ pub struct PenShape {
 }
 
 /// 统一的标注图元（后续扩展 Text…）
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub enum Annotation {
     Rect(BoxShape),
     Ellipse(BoxShape),
@@ -130,7 +130,7 @@ pub enum Annotation {
 }
 
 /// 文字标注：锚点为文字左上角（图片像素坐标）
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct TextAnnotation {
     pub x: f32,
     pub y: f32,
@@ -218,6 +218,22 @@ impl AnnotationStore {
     /// 清空撤销历史（保存后调用：保存=提交点，不再可撤销）
     pub fn clear_history(&mut self) {
         self.undo.clear();
+    }
+
+    /// 整体替换标注列表（加载持久化数据用；历史重置为加载时点）
+    pub fn set_items(&mut self, items: Vec<Annotation>) {
+        self.items = items;
+        self.undo.clear();
+    }
+
+    /// 序列化当前标注（annotations 表 data 字段）
+    pub fn to_json(&self) -> String {
+        serde_json::to_string(&self.items).unwrap_or_else(|_| "[]".into())
+    }
+
+    /// 反序列化标注列表（空/损坏时为空列表）
+    pub fn from_json(json: &str) -> Vec<Annotation> {
+        serde_json::from_str(json).unwrap_or_default()
     }
 
     pub fn len(&self) -> usize {

@@ -1,6 +1,6 @@
 // PhotoAnnotator 主窗口（第二阶段：图片加载 + 视图交互 + 矩形标注）
 // 预览矩形用原生元素实时显示（拖动流畅），完成后并入标注层位图
-import { Button } from "std-widgets.slint";
+import { Button, ListView } from "std-widgets.slint";
 
 /// 单行文字输入组件：FocusScope + 内建 TextInput（支持中文 IME）
 /// 相比 std LineEdit 可通过 forward-focus 编程聚焦（显示即输入，无需二次点击）
@@ -38,6 +38,16 @@ export struct TextDisplay {
     y: float,
     text: string,
     font-size: float,
+}
+
+/// 工作目录文件列表项
+export struct FileEntry {
+    path: string,
+    name: string,
+    // 状态：0=未处理 1=已标注 2=已忽略
+    status: int,
+    // 缩略图（Rust 端解码为 Slint Image）
+    thumb: image,
 }
 
 export component AppWindow inherits Window {
@@ -98,6 +108,15 @@ export component AppWindow inherits Window {
     property <float> disp-scale: root.fit-mode ? root.fit-scale : root.view-scale;
     property <length> disp-x: root.fit-mode ? root.fit-x : root.view-offset-x;
     property <length> disp-y: root.fit-mode ? root.fit-y : root.view-offset-y;
+
+    // ---- 工作目录（第三阶段）----
+    in-out property <string> workspace-title: "未打开工作目录";
+    in-out property <[FileEntry]> file-list: [];
+    // 当前选中图片索引（-1 = 无）
+    in-out property <int> current-index: -1;
+    // 列表点击项索引（属性传值，规避带参 callback 解析问题）
+    in-out property <int> clicked-file: -1;
+    callback select-file;
 
     // ---- 回调（Rust 端响应，无参；坐标经 pointer-x/y 属性传递）----
     callback zoom-in;
@@ -172,14 +191,99 @@ export component AppWindow inherits Window {
             }
         }
 
-        // ---- 画布区域：原图 + 标注层 + 预览 + 手势 ----
-        canvas-area := Rectangle {
+        // ---- 主体：工作目录侧边栏 + 画布 ----
+        HorizontalLayout {
             vertical-stretch: 1;
-            background: #FFFFFF;
-            border-radius: 6px;
-            border-width: 1px;
-            border-color: #E0E0E0;
-            clip: true;
+            spacing: 8px;
+            padding-left: 8px;
+            padding-right: 8px;
+            padding-bottom: 8px;
+
+            // ---- 工作目录侧边栏（极简模式隐藏）----
+            workspace-side := Rectangle {
+                visible: !root.minimal-mode;
+                width: 236px;
+                background: #FFFFFF;
+                border-radius: 6px;
+                border-width: 1px;
+                border-color: #E0E0E0;
+
+                VerticalLayout {
+                    padding: 6px;
+                    spacing: 4px;
+                    // 目录标题
+                    Text {
+                        text: root.workspace-title;
+                        font-size: 13px;
+                        font-weight: 600;
+                        color: #212121;
+                        overflow: elide;
+                    }
+                    Rectangle {
+                        height: 1px;
+                        background: #E0E0E0;
+                    }
+                    // 图片列表（虚拟化；点击加载到画布）
+                    ListView {
+                        vertical-stretch: 1;
+                        for entry[idx] in root.file-list: Rectangle {
+                            height: 46px;
+                            border-radius: 4px;
+                            background: idx == root.current-index ? #E3EDF8 : transparent;
+                            TouchArea {
+                                clicked => {
+                                    root.clicked-file = idx;
+                                    root.select-file();
+                                    canvas-fs.focus();
+                                }
+                                // 内容垂直居中（行高 46，内容高 30）
+                                VerticalLayout {
+                                    width: 100%;
+                                    height: 100%;
+                                    alignment: center;
+                                    HorizontalLayout {
+                                        padding-left: 6px;
+                                        padding-right: 6px;
+                                        spacing: 8px;
+                                        // 缩略图
+                                        Image {
+                                            width: 40px;
+                                            height: 30px;
+                                            source: entry.thumb;
+                                            image-fit: contain;
+                                        }
+                                        // 文件名
+                                        Text {
+                                            height: 100%;
+                                            vertical-alignment: center;
+                                            text: entry.name;
+                                            font-size: 12px;
+                                            color: #212121;
+                                            overflow: elide;
+                                        }
+                                        // 状态点（0 未处理灰 / 1 已标注蓝 / 2 已忽略浅灰）
+                                        Rectangle {
+                                            width: 8px;
+                                            height: 8px;
+                                            border-radius: 4px;
+                                            background: entry.status == 1 ? #4A90D9 : entry.status == 2 ? #BDBDBD : #9E9E9E;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            // ---- 画布区域：原图 + 标注层 + 预览 + 手势 ----
+            canvas-area := Rectangle {
+                horizontal-stretch: 1;
+                background: #FFFFFF;
+                border-radius: 6px;
+                border-width: 1px;
+                border-color: #E0E0E0;
+                clip: true;
 
             // 画布交互层：FocusScope 捕获键盘（点击画布后生效）
             canvas-fs := FocusScope {
@@ -326,6 +430,7 @@ export component AppWindow inherits Window {
                 }
             }
         }
+        } // <- canvas-area 包裹的 HorizontalLayout 闭合
 
         // ---- 状态栏（极简模式隐藏）----
         HorizontalLayout {

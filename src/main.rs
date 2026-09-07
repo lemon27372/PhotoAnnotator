@@ -8,11 +8,14 @@
 
 mod canvas;
 mod storage;
+mod workspace;
 
 use canvas::{Annotation, AnnotationStore, Tool, ViewTransform};
 use slint::{Image, Rgba8Pixel, SharedPixelBuffer, SharedString, Timer, TimerMode};
 use std::cell::RefCell;
 use std::rc::Rc;
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 slint::include_modules!();
@@ -174,6 +177,21 @@ struct AppState {
     image_path: Option<String>,
     /// 原图 straight-alpha RGBA（合成导出用）
     image_rgba: Vec<u8>,
+    // ---- 工作目录（第三阶段）----
+    /// 当前工作目录
+    workspace_dir: Option<String>,
+    /// DB workspace id（-1 = 单图模式未开工作区）
+    workspace_id: i64,
+    /// 当前目录图片绝对路径列表
+    files: Vec<String>,
+    /// 每张图的 DB file id
+    file_ids: Vec<i64>,
+    /// 当前图片在 files 中的索引（-1 = 无）
+    current_index: i64,
+    /// 当前图片 DB file id（-1 = 未入库）
+    file_id: i64,
+    /// 缩略图内存缓存（解码一次，重建列表复用）
+    thumb_cache: Vec<Option<slint::Image>>,
 }
 
 impl AppState {
@@ -185,6 +203,13 @@ impl AppState {
             image_height: 0,
             image_path: None,
             image_rgba: Vec::new(),
+            workspace_dir: None,
+            workspace_id: -1,
+            files: Vec::new(),
+            file_ids: Vec::new(),
+            current_index: -1,
+            file_id: -1,
+            thumb_cache: Vec::new(),
         }
     }
 }
@@ -200,6 +225,221 @@ fn annotated_save_path(original: Option<&str>) -> String {
         }
         None => "annotated.png".to_string(),
     }
+}
+
+// ---------- 工作目录（第三阶段 P1+P2） ----------
+
+/// PNG 字节 → Slint Image（缩略图显示）
+fn png_to_image(png: &[u8]) -> Option<Image> {
+    let img = image::load_from_memory(png).ok()?;
+    let rgba = img.to_rgba8();
+    let (w, h) = rgba.dimensions();
+    let mut buf = SharedPixelBuffer::<Rgba8Pixel>::new(w, h);
+    buf.make_mut_bytes().copy_from_slice(rgba.as_raw());
+    Some(Image::from_rgba8(buf))
+}
+
+/// 若当前图片已入库，把标注持久化到 DB（切图前调用）
+fn persist_current(st: &mut AppState) {
+    if st.file_id >= 0 {
+        storage::db::save_annotations(st.file_id, &st.store.to_json());
+    }
+}
+
+/// 获取/生成某文件缩略图（DB 缓存 → 生成并缓存），并写入内存缓存
+fn ensure_thumbnail(st: &mut AppState, idx: usize) -> Option<Image> {
+    if let Some(img) = st.thumb_cache.get(idx).and_then(|c| c.clone()) {
+        return Some(img);
+    }
+    if st.thumb_cache.len() <= idx {
+        st.thumb_cache.resize(idx + 1, None);
+    }
+    let img = (|| {
+        let file_id = *st.file_ids.get(idx)?;
+        // DB 缓存命中
+        if let Some(png) = storage::db::load_thumbnail(file_id) {
+            if let Some(img) = png_to_image(&png) {
+                return Some(img);
+            }
+        }
+        // 生成并缓存
+        let path = std::path::Path::new(st.files.get(idx)?);
+        let png = workspace::gen_thumbnail_png(path, 96)?;
+        storage::db::save_thumbnail(file_id, &png);
+        png_to_image(&png)
+    })();
+    st.thumb_cache[idx] = img.clone();
+    img
+}
+
+/// 重建侧边栏列表 model（状态 + 缩略图）
+fn rebuild_file_list(app: &AppWindow, st: &mut AppState) {
+    // 先收集各文件元信息，避免借用冲突
+    let meta: Vec<(String, String, i32)> = st
+        .files
+        .iter()
+        .map(|path| {
+            let name = std::path::Path::new(path)
+                .file_name()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_else(|| path.clone());
+            let status = if st.workspace_id >= 0 {
+                match storage::db::file_status(st.workspace_id, path).as_str() {
+                    "done" => 1,
+                    "ignored" => 2,
+                    _ => 0,
+                }
+            } else {
+                0
+            };
+            (path.clone(), name, status)
+        })
+        .collect();
+
+    let mut entries: Vec<FileEntry> = Vec::with_capacity(meta.len());
+    for (i, (path, name, status)) in meta.into_iter().enumerate() {
+        let thumb = ensure_thumbnail(st, i).unwrap_or_default();
+        entries.push(FileEntry {
+            path: path.into(),
+            name: name.into(),
+            status,
+            thumb,
+        });
+    }
+    app.set_file_list(slint::ModelRc::from(Rc::new(slint::VecModel::from(entries))));
+}
+
+/// 打开工作目录：扫描 + 入库索引 + 重建列表
+fn open_workspace(app: &AppWindow, st: &mut AppState, dir: &str) {
+    persist_current(st);
+    let dir_path = std::path::Path::new(dir);
+    st.files = workspace::scan_images(dir_path)
+        .iter()
+        .map(|p| p.to_string_lossy().into_owned())
+        .collect();
+    st.workspace_dir = Some(dir.to_string());
+    st.workspace_id = storage::db::touch_workspace(dir).unwrap_or(-1);
+    st.thumb_cache = Vec::new();
+    st.current_index = -1;
+    st.file_id = -1;
+    st.file_ids.clear();
+    // 入库获取 file id（宽高暂 0，打开时更新）
+    if st.workspace_id >= 0 {
+        for p in &st.files {
+            st.file_ids.push(storage::db::upsert_file(st.workspace_id, p, 0, 0).unwrap_or(-1));
+        }
+    }
+    let title = dir_path
+        .file_name()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| dir.to_string());
+    app.set_workspace_title(SharedString::from(title));
+    rebuild_file_list(app, st);
+    app.set_current_index(-1);
+    if st.files.is_empty() {
+        app.set_status(SharedString::from(format!("{dir} 中没有支持的图片")));
+    }
+}
+
+/// 后台解码完成的结果（Send，可跨线程排队）
+struct LoadResult {
+    /// 发起时的序号（过期的丢弃）
+    seq: u32,
+    /// 目标索引（更新选中态）
+    current_index: i64,
+    path: String,
+    workspace_id: i64,
+    /// Ok(宽, 高, RGBA) / Err(描述)
+    decoded: Result<(u32, u32, Vec<u8>), String>,
+}
+
+/// 发起异步加载：主线程同步持久化旧标注并提示，后台线程解码，结果入队由主线程轮询应用
+fn load_image_by_index(
+    app: &AppWindow,
+    state: &Rc<RefCell<AppState>>,
+    idx: usize,
+    load_seq: &Arc<AtomicU32>,
+    queue: &Arc<Mutex<Vec<LoadResult>>>,
+) {
+    let mut st = state.borrow_mut();
+    if idx >= st.files.len() {
+        return;
+    }
+    // 同步：持久化旧标注 + 清理交互状态 + 提示加载中
+    persist_current(&mut st);
+    st.interaction = Interaction::None;
+    hide_previews(app);
+    hide_text_input(app);
+    app.set_status(SharedString::from("加载中…"));
+
+    // 快照线程所需数据
+    let path = st.files[idx].clone();
+    let workspace_id = st.workspace_id;
+    let current_index = idx as i64;
+    drop(st);
+
+    // 递增序号，本次任务为最新
+    let this_seq = load_seq.fetch_add(1, Ordering::Relaxed) + 1;
+
+    // 后台线程：仅解码（Send 数据），结果入队
+    let queue = queue.clone();
+    std::thread::spawn(move || {
+        let decoded = canvas::decode_image(&path).map_err(|e| e.to_string());
+        let result = LoadResult { seq: this_seq, current_index, path, workspace_id, decoded };
+        if let Ok(mut q) = queue.lock() {
+            q.push(result);
+        }
+    });
+}
+
+/// 应用一次加载结果（主线程 Timer 轮询队列时调用）
+fn apply_load_result(app: &AppWindow, state: &Rc<RefCell<AppState>>, r: LoadResult) {
+    let mut st = state.borrow_mut();
+    let (w, h, rgba) = match r.decoded {
+        Ok(v) => v,
+        Err(e) => {
+            app.set_status(SharedString::from(format!("加载失败: {e}")));
+            return;
+        }
+    };
+    let mut buffer = SharedPixelBuffer::<Rgba8Pixel>::new(w, h);
+    buffer.make_mut_bytes().copy_from_slice(&rgba);
+    let image = Image::from_rgba8(buffer);
+
+    app.set_current_image(image);
+    app.set_image_width(w as f32);
+    app.set_image_height(h as f32);
+    st.image_width = w;
+    st.image_height = h;
+    st.image_path = Some(r.path.clone());
+    st.image_rgba = rgba;
+    st.current_index = r.current_index;
+    // 更新尺寸并读取历史标注（DB 读写快，主线程即可）
+    if r.workspace_id >= 0 {
+        if let Some(fid) = storage::db::upsert_file(r.workspace_id, &r.path, w as i32, h as i32) {
+            st.file_id = fid;
+            if r.current_index >= 0 && (r.current_index as usize) < st.file_ids.len() {
+                st.file_ids[r.current_index as usize] = fid;
+            }
+            let json = storage::db::load_annotations(fid);
+            let items = AnnotationStore::from_json(&json);
+            st.store.set_items(items);
+        }
+    } else {
+        st.file_id = -1;
+        st.store.set_items(Vec::new());
+    }
+    update_overlay(app, &st);
+    app.set_current_index(r.current_index as i32);
+    app.set_fit_mode(true);
+    let name = std::path::Path::new(&r.path)
+        .file_name()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| r.path.clone());
+    app.set_status(SharedString::from(format!(
+        "已加载: {name} ({w}x{h}) · 标注 {}",
+        st.store.len()
+    )));
 }
 
 /// 重渲染标注层（仅已完成的图元）并推到 Slint
@@ -270,27 +510,53 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 2. 窗口
     let app = AppWindow::new()?;
     let state = Rc::new(RefCell::new(AppState::new()));
+    // 异步切图：序号（edition2024 中 gen 是保留字）+ 完成队列
+    let load_seq = Arc::new(AtomicU32::new(0));
+    let load_queue: Arc<Mutex<Vec<LoadResult>>> = Arc::new(Mutex::new(Vec::new()));
 
-    // 3. 图片：命令行参数加载
-    if let Some(path) = std::env::args().nth(1) {
-        match canvas::load_image(&path) {
-            Ok((image, w, h, rgba)) => {
-                app.set_current_image(image);
-                app.set_image_width(w as f32);
-                app.set_image_height(h as f32);
+    // 3. 命令行参数：目录 → 工作目录模式；文件 → 单图模式
+    if let Some(arg) = std::env::args().nth(1) {
+        let arg_path = std::path::Path::new(&arg);
+        if arg_path.is_dir() {
+            // 工作目录模式：打开目录并加载第一张
+            let title = arg_path
+                .file_name()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_else(|| arg.clone());
+            println!("[workspace] 打开工作目录: {arg}");
+            {
                 let mut st = state.borrow_mut();
-                st.image_width = w;
-                st.image_height = h;
-                st.image_path = Some(path.clone());
-                st.image_rgba = rgba;
-                drop(st);
-                app.set_fit_mode(true); // 默认自适应
-                app.set_status(SharedString::from(format!("已加载: {path} ({w}x{h})")));
-                println!("[canvas] 图片加载成功: {path} {w}x{h}");
+                open_workspace(&app, &mut st, &arg);
+                st.workspace_dir = Some(arg.clone());
             }
-            Err(e) => {
-                app.set_status(SharedString::from(format!("加载失败: {e}")));
-                eprintln!("[canvas] 图片加载失败: {path}: {e}");
+            // 自动加载第一张（异步）
+            let count = state.borrow().files.len();
+            if count > 0 {
+                load_image_by_index(&app, &state, 0, &load_seq, &load_queue);
+            } else {
+                app.set_workspace_title(SharedString::from(title));
+            }
+        } else {
+            // 单图模式
+            match canvas::load_image(&arg) {
+                Ok((image, w, h, rgba)) => {
+                    app.set_current_image(image);
+                    app.set_image_width(w as f32);
+                    app.set_image_height(h as f32);
+                    let mut st = state.borrow_mut();
+                    st.image_width = w;
+                    st.image_height = h;
+                    st.image_path = Some(arg.clone());
+                    st.image_rgba = rgba;
+                    drop(st);
+                    app.set_fit_mode(true); // 默认自适应
+                    app.set_status(SharedString::from(format!("已加载: {arg} ({w}x{h})")));
+                    println!("[canvas] 图片加载成功: {arg} {w}x{h}");
+                }
+                Err(e) => {
+                    app.set_status(SharedString::from(format!("加载失败: {e}")));
+                    eprintln!("[canvas] 图片加载失败: {arg}: {e}");
+                }
             }
         }
     }
@@ -386,6 +652,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 Ok(_) => {
                     st.store.clear_history();
                     let n = st.store.len();
+                    // 工作目录模式：标注已保存 → 状态置 done 并刷新列表
+                    if st.workspace_id >= 0 {
+                        if let Some(p) = st.image_path.clone() {
+                            storage::db::set_file_status(st.workspace_id, &p, "done");
+                            persist_current(&mut st);
+                            rebuild_file_list(&app, &mut st);
+                        }
+                    }
                     app.set_status(SharedString::from(format!(
                         "已保存: {out_path}（{n} 个标注，撤销历史已重置）"
                     )));
@@ -514,6 +788,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 )));
             } else {
                 app.set_status(SharedString::from("输入为空，已取消"));
+            }
+        });
+    }
+    {
+        // 侧边栏点击：加载所选图片（异步，先持久化旧标注）
+        let weak = app.as_weak();
+        let state = state.clone();
+        let load_seq = load_seq.clone();
+        let load_queue = load_queue.clone();
+        app.on_select_file(move || {
+            let Some(app) = weak.upgrade() else {
+                return;
+            };
+            let idx = app.get_clicked_file();
+            if idx >= 0 {
+                load_image_by_index(&app, &state, idx as usize, &load_seq, &load_queue);
             }
         });
     }
@@ -683,10 +973,43 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         });
     }
 
+    // 7. 异步加载结果轮询：主线程应用解码完成的切图（过期序号丢弃）
+    let load_timer = Timer::default();
+    {
+        let weak = app.as_weak();
+        let state = state.clone();
+        let load_seq = load_seq.clone();
+        let load_queue = load_queue.clone();
+        load_timer.start(TimerMode::Repeated, Duration::from_millis(80), move || {
+            // 取出队列中最新一条未过期结果应用
+            let result: Option<LoadResult> = {
+                let mut q = match load_queue.lock() {
+                    Ok(q) => q,
+                    Err(_) => return,
+                };
+                let latest_seq = load_seq.load(Ordering::Relaxed);
+                // 只保留序号最新的结果（保留最后一个匹配项）
+                let mut picked = None;
+                while let Some(r) = q.pop() {
+                    if r.seq == latest_seq {
+                        picked = Some(r);
+                    }
+                }
+                picked
+            };
+            if let Some(r) = result {
+                if let Some(app) = weak.upgrade() {
+                    apply_load_result(&app, &state, r);
+                }
+            }
+        });
+    }
+
     println!("[ui] Slint 窗口启动");
     app.run()?;
 
     // timer 需保持存活到窗口关闭
     std::mem::drop(timer);
+    std::mem::drop(load_timer);
     Ok(())
 }

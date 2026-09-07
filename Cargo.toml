@@ -26,6 +26,9 @@ image = { version = "0.25", default-features = false, features = ["png", "jpeg",
 arboard = "3"
 # 文字标注导出渲染：字体栅格化（TinySkia 无文本 API）
 fontdue = "0.9"
+# 标注持久化序列化（annotations 表 JSON）
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 
 [build-dependencies]
 # 编译 ui/*.slint 声明文件（build.rs 使用）

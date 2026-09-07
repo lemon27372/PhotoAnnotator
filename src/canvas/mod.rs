@@ -11,5 +11,5 @@ pub mod render;
 pub mod view;
 
 pub use annotation::{Annotation, AnnotationStore, Tool};
-pub use loader::load_image;
+pub use loader::{decode_image, load_image};
 pub use view::ViewTransform;
