@@ -1,6 +1,6 @@
 // PhotoAnnotator 主窗口（第二阶段：图片加载 + 视图交互 + 矩形标注）
 // 预览矩形用原生元素实时显示（拖动流畅），完成后并入标注层位图
-import { Button, ListView, ScrollView } from "std-widgets.slint";
+import { Button, ListView } from "std-widgets.slint";
 
 /// 单行文字输入组件：FocusScope + 内建 TextInput（支持中文 IME）
 /// 相比 std LineEdit 可通过 forward-focus 编程聚焦（显示即输入，无需二次点击）
@@ -94,14 +94,14 @@ component SideBtn {
     }
 }
 
-/// 网格视图单元格（3 列固定；kind=-1 为空占位，不可交互）
+/// 网格视图单元格（行内等分；kind=-1 为空占位不可交互；悬停 Tooltip 显示完整文件名）
 component GridCell {
     in property <FileEntry> entry;
     in property <int> gidx;
     in property <int> current-row: -1;
     callback clicked;
-    width: 58px;
-    height: 68px;
+    // 行内三等分（父为行内 HorizontalLayout）
+    horizontal-stretch: 1;
     Rectangle {
         width: 100%;
         height: 100%;
@@ -109,6 +109,26 @@ component GridCell {
         background: root.entry.kind == -1 ? transparent
             : root.gidx == root.current-row ? #E3EDF8
             : root.entry.kind == 1 ? #EFF4FB : transparent;
+        // 长文件名 elide 截断 → 悬停显示完整名称（白底小窗）
+        if root.entry.kind >= 0: Tooltip {
+            Rectangle {
+                background: #FFFFFF;
+                border-radius: 4px;
+                border-width: 1px;
+                border-color: #E0E0E0;
+                VerticalLayout {
+                    padding-left: 8px;
+                    padding-right: 8px;
+                    padding-top: 4px;
+                    padding-bottom: 4px;
+                    Text {
+                        text: root.entry.name;
+                        font-size: 11px;
+                        color: #212121;
+                    }
+                }
+            }
+        }
         TouchArea {
             enabled: root.entry.kind >= 0;
             clicked => { root.clicked(); }
@@ -118,16 +138,18 @@ component GridCell {
             height: 100%;
             alignment: center;
             spacing: 2px;
+            padding-left: 4px;
+            padding-right: 4px;
             // 缩略图 / 目录图标位（占位格透明空位；kind 互斥，用独立 if）
             if root.entry.kind == 0: Image {
                 width: 44px;
-                height: 32px;
+                height: 30px;
                 source: root.entry.thumb;
                 image-fit: contain;
             }
             if root.entry.kind == 1: Rectangle {
                 width: 44px;
-                height: 32px;
+                height: 30px;
                 background: #D6E6F8;
                 border-radius: 4px;
                 Text {
@@ -142,11 +164,11 @@ component GridCell {
             }
             if root.entry.kind == -1: Rectangle {
                 width: 44px;
-                height: 32px;
+                height: 30px;
             }
-            // 名称
+            // 名称（fill 行宽；超长 elide，完整名见 Tooltip）
             Text {
-                width: 52px;
+                width: 100%;
                 text: root.entry.name;
                 font-size: 10px;
                 color: root.entry.kind == 1 ? #4A90D9 : #212121;
@@ -468,6 +490,26 @@ export component AppWindow inherits Window {
                             height: 46px;
                             border-radius: 4px;
                             background: idx == root.current-row ? #E3EDF8 : transparent;
+                            // 文件名 elide 截断 → 悬停显示完整名（白底小窗）
+                            Tooltip {
+                                Rectangle {
+                                    background: #FFFFFF;
+                                    border-radius: 4px;
+                                    border-width: 1px;
+                                    border-color: #E0E0E0;
+                                    VerticalLayout {
+                                        padding-left: 8px;
+                                        padding-right: 8px;
+                                        padding-top: 4px;
+                                        padding-bottom: 4px;
+                                        Text {
+                                            text: entry.name;
+                                            font-size: 11px;
+                                            color: #212121;
+                                        }
+                                    }
+                                }
+                            }
                             TouchArea {
                                 clicked => {
                                     root.clicked-file = idx;
@@ -520,14 +562,18 @@ export component AppWindow inherits Window {
                         }
                     }
 
-                    // ---- 网格视图（非虚拟化：3 列缩略图，ScrollView 滚动）----
-                    ScrollView {
+                    // ---- 网格视图（ListView 行 = 3 格；行从列表顶部起排，虚拟化滚动）----
+                    ListView {
                         vertical-stretch: 1;
                         visible: root.view-mode == 1;
-                        GridLayout {
-                            spacing: 6px;
-                            padding: 4px;
-                            for row[ri] in root.grid-rows: Row {
+                        for row[ri] in root.grid-rows: Rectangle {
+                            height: 72px;
+                            HorizontalLayout {
+                                width: 100%;
+                                height: 100%;
+                                padding-left: 4px;
+                                padding-right: 4px;
+                                spacing: 6px;
                                 GridCell { entry: row.c0; gidx: ri * 3 + 0; current-row: root.current-row; clicked => { root.clicked-file = self.gidx; root.select-file(); canvas-fs.focus(); } }
                                 GridCell { entry: row.c1; gidx: ri * 3 + 1; current-row: root.current-row; clicked => { root.clicked-file = self.gidx; root.select-file(); canvas-fs.focus(); } }
                                 GridCell { entry: row.c2; gidx: ri * 3 + 2; current-row: root.current-row; clicked => { root.clicked-file = self.gidx; root.select-file(); canvas-fs.focus(); } }
