@@ -109,7 +109,11 @@ component GridCell {
         background: root.entry.kind == -1 ? transparent
             : root.gidx == root.current-row ? #E3EDF8
             : root.entry.kind == 1 ? #EFF4FB : transparent;
-        // 长文件名 elide 截断 → 悬停显示完整名称（白底小窗）
+        TouchArea {
+            enabled: root.entry.kind >= 0;
+            clicked => { root.clicked(); }
+        }
+        // Tooltip 须声明在 TouchArea 之后（顶层）才能收到 hover；TooltipArea 不消费事件，点击穿透到 TouchArea
         if root.entry.kind >= 0: Tooltip {
             Rectangle {
                 background: #FFFFFF;
@@ -128,10 +132,6 @@ component GridCell {
                     }
                 }
             }
-        }
-        TouchArea {
-            enabled: root.entry.kind >= 0;
-            clicked => { root.clicked(); }
         }
         VerticalLayout {
             width: 100%;
@@ -482,34 +482,15 @@ export component AppWindow inherits Window {
                         background: #E0E0E0;
                     }
 
-                    // ---- 列表视图（虚拟化；单击图=切图，双击目录=进入）----
-                    ListView {
+                    // ---- 视图内容区（if 条件实例化：false 分支完全不占布局空间，
+                    //      避免 visible 切换时隐藏 ListView 仍按隐式高度占位把内容推到底部）----
+                    // 列表视图（虚拟化；单击图=切图，双击目录=进入）
+                    if root.view-mode == 0: ListView {
                         vertical-stretch: 1;
-                        visible: root.view-mode == 0;
                         for entry[idx] in root.file-list: Rectangle {
                             height: 46px;
                             border-radius: 4px;
                             background: idx == root.current-row ? #E3EDF8 : transparent;
-                            // 文件名 elide 截断 → 悬停显示完整名（白底小窗）
-                            Tooltip {
-                                Rectangle {
-                                    background: #FFFFFF;
-                                    border-radius: 4px;
-                                    border-width: 1px;
-                                    border-color: #E0E0E0;
-                                    VerticalLayout {
-                                        padding-left: 8px;
-                                        padding-right: 8px;
-                                        padding-top: 4px;
-                                        padding-bottom: 4px;
-                                        Text {
-                                            text: entry.name;
-                                            font-size: 11px;
-                                            color: #212121;
-                                        }
-                                    }
-                                }
-                            }
                             TouchArea {
                                 clicked => {
                                     root.clicked-file = idx;
@@ -559,13 +540,32 @@ export component AppWindow inherits Window {
                                     }
                                 }
                             }
+                        // Tooltip 声明在 TouchArea 之后（顶层收 hover；TooltipArea 不消费事件，点击穿透到 TouchArea）
+                        Tooltip {
+                            Rectangle {
+                                background: #FFFFFF;
+                                border-radius: 4px;
+                                border-width: 1px;
+                                border-color: #E0E0E0;
+                                VerticalLayout {
+                                    padding-left: 8px;
+                                    padding-right: 8px;
+                                    padding-top: 4px;
+                                    padding-bottom: 4px;
+                                    Text {
+                                        text: entry.name;
+                                        font-size: 11px;
+                                        color: #212121;
+                                    }
+                                }
+                            }
+                        }
                         }
                     }
 
-                    // ---- 网格视图（ListView 行 = 3 格；行从列表顶部起排，虚拟化滚动）----
-                    ListView {
+                    // 网格视图（ListView 行 = 3 格；虚拟化滚动）
+                    if root.view-mode == 1: ListView {
                         vertical-stretch: 1;
-                        visible: root.view-mode == 1;
                         for row[ri] in root.grid-rows: Rectangle {
                             height: 72px;
                             HorizontalLayout {
