@@ -7,25 +7,24 @@
 // 仅渲染方式不同（stroke rect path / stroke oval path）
 
 /// 当前激活的画布工具（id 与 .slint active-tool 对应）
+/// 无「浏览」工具（2026-09-08 产品决策：平移 = 任意工具下中/右键按住拖动）
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Tool {
-    Browse = 0,
-    Rect = 1,
-    Ellipse = 2,
-    Arrow = 3,
-    Pen = 4,
-    Text = 5,
+    Rect = 0,
+    Ellipse = 1,
+    Arrow = 2,
+    Pen = 3,
+    Text = 4,
 }
 
 impl Tool {
     pub fn from_id(id: i32) -> Self {
         match id {
-            1 => Tool::Rect,
-            2 => Tool::Ellipse,
-            3 => Tool::Arrow,
-            4 => Tool::Pen,
-            5 => Tool::Text,
-            _ => Tool::Browse,
+            1 => Tool::Ellipse,
+            2 => Tool::Arrow,
+            3 => Tool::Pen,
+            4 => Tool::Text,
+            _ => Tool::Rect,
         }
     }
 }

@@ -176,7 +176,7 @@ export component AppWindow inherits Window {
     in-out property <length> view-offset-y: 0px;
     // true=自适应模式；false=自由模式
     in-out property <bool> fit-mode: true;
-    // 当前工具：0=浏览 1=矩形
+    // 当前工具：0=矩形 1=椭圆 2=箭头 3=画笔 4=文字（无浏览；平移=任意工具下中/右键拖动）
     in-out property <int> active-tool: 0;
     // 极简模式：隐藏工具条/状态栏，仅画布 + 全键盘操作（Ctrl+M 切换）
     in-out property <bool> minimal-mode: false;
@@ -262,6 +262,8 @@ export component AppWindow inherits Window {
     callback text-commit;
     in-out property <length> pointer-x: 0px;
     in-out property <length> pointer-y: 0px;
+    // 按下按键：0=左 1=中 2=右（pointer-event down 时写入；中/右键=平移）
+    in-out property <int> pointer-button: 0;
     callback pointer-down;
     callback pointer-move;
     callback pointer-up;
@@ -275,28 +277,24 @@ export component AppWindow inherits Window {
             padding-right: 8px;
             spacing: 4px;
             Button {
-                text: "浏览";
+                text: "矩形";
                 clicked => { root.active-tool = 0; root.tool-changed(); canvas-fs.focus(); }
             }
             Button {
-                text: "矩形";
+                text: "椭圆";
                 clicked => { root.active-tool = 1; root.tool-changed(); canvas-fs.focus(); }
             }
             Button {
-                text: "椭圆";
+                text: "箭头";
                 clicked => { root.active-tool = 2; root.tool-changed(); canvas-fs.focus(); }
             }
             Button {
-                text: "箭头";
+                text: "画笔";
                 clicked => { root.active-tool = 3; root.tool-changed(); canvas-fs.focus(); }
             }
             Button {
-                text: "画笔";
-                clicked => { root.active-tool = 4; root.tool-changed(); canvas-fs.focus(); }
-            }
-            Button {
                 text: "文字";
-                clicked => { root.active-tool = 5; root.tool-changed(); canvas-fs.focus(); }
+                clicked => { root.active-tool = 4; root.tool-changed(); canvas-fs.focus(); }
             }
             Rectangle { width: 8px; }
             Button {
@@ -316,6 +314,13 @@ export component AppWindow inherits Window {
             Button {
                 text: "重置";
                 clicked => { root.reset-view(); canvas-fs.focus(); }
+            }
+            Rectangle { horizontal-stretch: 1; }
+            Text {
+                vertical-alignment: center;
+                text: "中键/右键拖动 = 平移 · 滚轮 = 缩放";
+                font-size: 11px;
+                color: #9E9E9E;
             }
         }
 
@@ -583,17 +588,16 @@ export component AppWindow inherits Window {
             // 画布交互层：FocusScope 捕获键盘（点击画布后生效）
             canvas-fs := FocusScope {
                 // ---- 键盘快捷键（@keys 字面量；输入文字时禁用，避免劫持按键）----
-                KeyBinding { enabled: !root.text-input-visible; keys: @keys("0"); activated => { root.active-tool = 0; root.tool-changed(); } }
-                KeyBinding { enabled: !root.text-input-visible; keys: @keys("1"); activated => { root.active-tool = 1; root.tool-changed(); } }
-                KeyBinding { enabled: !root.text-input-visible; keys: @keys("2"); activated => { root.active-tool = 2; root.tool-changed(); } }
-                KeyBinding { enabled: !root.text-input-visible; keys: @keys("3"); activated => { root.active-tool = 3; root.tool-changed(); } }
-                KeyBinding { enabled: !root.text-input-visible; keys: @keys("4"); activated => { root.active-tool = 4; root.tool-changed(); } }
-                KeyBinding { enabled: !root.text-input-visible; keys: @keys("5"); activated => { root.active-tool = 5; root.tool-changed(); } }
-                KeyBinding { enabled: !root.text-input-visible; keys: @keys("r"); activated => { root.active-tool = 1; root.tool-changed(); } }
-                KeyBinding { enabled: !root.text-input-visible; keys: @keys("o"); activated => { root.active-tool = 2; root.tool-changed(); } }
-                KeyBinding { enabled: !root.text-input-visible; keys: @keys("a"); activated => { root.active-tool = 3; root.tool-changed(); } }
-                KeyBinding { enabled: !root.text-input-visible; keys: @keys("p"); activated => { root.active-tool = 4; root.tool-changed(); } }
-                KeyBinding { enabled: !root.text-input-visible; keys: @keys("t"); activated => { root.active-tool = 5; root.tool-changed(); } }
+                KeyBinding { enabled: !root.text-input-visible; keys: @keys("1"); activated => { root.active-tool = 0; root.tool-changed(); } }
+                KeyBinding { enabled: !root.text-input-visible; keys: @keys("2"); activated => { root.active-tool = 1; root.tool-changed(); } }
+                KeyBinding { enabled: !root.text-input-visible; keys: @keys("3"); activated => { root.active-tool = 2; root.tool-changed(); } }
+                KeyBinding { enabled: !root.text-input-visible; keys: @keys("4"); activated => { root.active-tool = 3; root.tool-changed(); } }
+                KeyBinding { enabled: !root.text-input-visible; keys: @keys("5"); activated => { root.active-tool = 4; root.tool-changed(); } }
+                KeyBinding { enabled: !root.text-input-visible; keys: @keys("r"); activated => { root.active-tool = 0; root.tool-changed(); } }
+                KeyBinding { enabled: !root.text-input-visible; keys: @keys("o"); activated => { root.active-tool = 1; root.tool-changed(); } }
+                KeyBinding { enabled: !root.text-input-visible; keys: @keys("a"); activated => { root.active-tool = 2; root.tool-changed(); } }
+                KeyBinding { enabled: !root.text-input-visible; keys: @keys("p"); activated => { root.active-tool = 3; root.tool-changed(); } }
+                KeyBinding { enabled: !root.text-input-visible; keys: @keys("t"); activated => { root.active-tool = 4; root.tool-changed(); } }
                 KeyBinding { enabled: !root.text-input-visible; keys: @keys(Control+Z); activated => { root.undo(); } }
                 KeyBinding { enabled: !root.text-input-visible; keys: @keys(Control+C); activated => { root.copy(); } }
                 KeyBinding { enabled: !root.text-input-visible; keys: @keys(Control+S); activated => { root.save(); } }
@@ -667,18 +671,43 @@ export component AppWindow inherits Window {
                         }
                         return EventResult.accept;
                     }
-                    // 仅左键触发绘制/平移
+                    // 左键 = 当前工具操作（绘制/文字落点）；中键/右键 = 平移（任意工具）
                     pointer-event(event) => {
                         if event.button == PointerEventButton.left {
                             if event.kind == PointerEventKind.down {
+                                root.pointer-button = 0;
                                 canvas-fs.focus(); // 点击画布 → 键盘焦点交给快捷键层
                                 root.pointer-x = touch.mouse_x;
                                 root.pointer-y = touch.mouse_y;
                                 root.pointer-down();
                                 // 文字工具落点：输入框显示后立即聚焦（forward 到 TextInput，可直接打字/IME）
-                                if root.active-tool == 5 {
+                                if root.active-tool == 4 {
                                     inline-text.focus();
                                 }
+                            } else if event.kind == PointerEventKind.up {
+                                root.pointer-x = touch.mouse_x;
+                                root.pointer-y = touch.mouse_y;
+                                root.pointer-up();
+                            }
+                        } else if event.button == PointerEventButton.middle {
+                            if event.kind == PointerEventKind.down {
+                                root.pointer-button = 1;
+                                canvas-fs.focus();
+                                root.pointer-x = touch.mouse_x;
+                                root.pointer-y = touch.mouse_y;
+                                root.pointer-down();
+                            } else if event.kind == PointerEventKind.up {
+                                root.pointer-x = touch.mouse_x;
+                                root.pointer-y = touch.mouse_y;
+                                root.pointer-up();
+                            }
+                        } else if event.button == PointerEventButton.right {
+                            if event.kind == PointerEventKind.down {
+                                root.pointer-button = 2;
+                                canvas-fs.focus();
+                                root.pointer-x = touch.mouse_x;
+                                root.pointer-y = touch.mouse_y;
+                                root.pointer-down();
                             } else if event.kind == PointerEventKind.up {
                                 root.pointer-x = touch.mouse_x;
                                 root.pointer-y = touch.mouse_y;

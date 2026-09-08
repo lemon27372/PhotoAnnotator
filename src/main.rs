@@ -1,10 +1,11 @@
-// PhotoAnnotator 入口（第二阶段：图片加载 + 视图交互 + 矩形/椭圆标注）
+// PhotoAnnotator 入口（第二/三阶段：图片加载 + 视图交互 + 标注 + 工作目录）
 //
-// 交互模型：
-//   浏览工具：拖动平移 / 滚轮缩放（锚点=鼠标）；窗口变化自动回自适应
-//   矩形/椭圆工具：按下拖动绘制（图片坐标），松开加入标注集合并显示在标注层
+// 交互模型（2026-09-08 起无浏览工具）：
+//   平移：任意工具下按住中键或右键拖动；滚轮缩放（锚点=鼠标）；窗口变化自动回自适应
+//   矩形/椭圆/箭头/画笔：左键按下拖动绘制（图片坐标），松开加入标注集合并显示在标注层
+//   文字：左键点击落点弹输入框，Enter 确认
 //
-// 用法：photo_annotator <图片路径>
+// 用法：photo_annotator <图片路径 | 工作目录>
 
 mod canvas;
 mod storage;
@@ -136,7 +137,7 @@ fn show_preview(app: &AppWindow, tool: Tool, x1: f32, y1: f32, x2: f32, y2: f32)
         Tool::Rect => show_rect_preview(app, x1, y1, x2, y2),
         Tool::Ellipse => show_ellipse_preview(app, x1, y1, x2, y2),
         Tool::Arrow => show_arrow_preview(app, x1, y1, x2, y2),
-        Tool::Pen | Tool::Browse | Tool::Text => {}
+        Tool::Pen | Tool::Text => {}
     }
 }
 
@@ -161,7 +162,7 @@ fn show_pen_preview(app: &AppWindow, points: &[(f32, f32)]) {
 /// 当前指针交互（一次按下 → 释放期间）
 enum Interaction {
     None,
-    /// 浏览工具下按住拖动 = 平移
+    /// 中键/右键按住拖动 = 平移（任意工具下；浏览工具已移除）
     Panning { last: (f32, f32) },
     /// 绘制工具下按住拖动 = 绘制图元（起止点均为图片像素坐标）
     DrawingShape { start: (f32, f32), current: (f32, f32) },
@@ -678,7 +679,7 @@ fn annotation_from_shape(tool: Tool, x1: f32, y1: f32, x2: f32, y2: f32) -> Anno
         Tool::Rect => Annotation::rect(x1, y1, x2, y2),
         Tool::Ellipse => Annotation::ellipse(x1, y1, x2, y2),
         Tool::Arrow => Annotation::arrow(x1, y1, x2, y2),
-        Tool::Browse | Tool::Pen | Tool::Text => unreachable!("非两点式工具不走此创建路径"),
+        Tool::Pen | Tool::Text => unreachable!("非两点式工具不走此创建路径"),
     }
 }
 
@@ -773,12 +774,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             hide_previews(&app);
             hide_text_input(&app);
             let msg = match Tool::from_id(app.get_active_tool()) {
-                Tool::Browse => "浏览工具：拖动平移 / 滚轮缩放",
-                Tool::Rect => "矩形工具：按住左键拖动画框",
-                Tool::Ellipse => "椭圆工具：按住左键拖动画框",
-                Tool::Arrow => "箭头工具：从起点拖到终点",
-                Tool::Pen => "画笔工具：按住左键手绘",
-                Tool::Text => "文字工具：点击画布放置文字",
+                Tool::Rect => "矩形工具：按住左键拖动画框（中键/右键拖动平移）",
+                Tool::Ellipse => "椭圆工具：按住左键拖动画框（中键/右键拖动平移）",
+                Tool::Arrow => "箭头工具：从起点拖到终点（中键/右键拖动平移）",
+                Tool::Pen => "画笔工具：按住左键手绘（中键/右键拖动平移）",
+                Tool::Text => "文字工具：点击画布放置文字（中键/右键拖动平移）",
             };
             app.set_status(SharedString::from(msg));
         });
@@ -1135,6 +1135,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             };
             let cx = app.get_pointer_x();
             let cy = app.get_pointer_y();
+            // 中键(1)/右键(2) → 任意工具下平移（无需浏览工具）
+            if app.get_pointer_button() != 0 {
+                ensure_free(&app);
+                // 拖动平移不应把输入框草稿误提交（锚点随视图偏移）
+                if app.get_text_input_visible() {
+                    hide_text_input(&app);
+                }
+                hide_previews(&app);
+                st.interaction = Interaction::Panning { last: (cx, cy) };
+                app.set_status(SharedString::from("平移中 · 拖动移动画布"));
+                return;
+            }
             // 输入框流转：文字工具下再次点击 = 先提交当前文字再开新框；
             // 其他工具下点击（含切工具回调） = 丢弃输入
             let current_tool = Tool::from_id(app.get_active_tool());
@@ -1142,12 +1154,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 hide_text_input(&app);
             }
             match current_tool {
-                Tool::Browse => {
-                    // 平移需自由模式（视图固定，随鼠标移动）
-                    ensure_free(&app);
-                    st.interaction = Interaction::Panning { last: (cx, cy) };
-                    app.set_status(SharedString::from("浏览 · 拖动平移"));
-                }
                 Tool::Rect | Tool::Ellipse | Tool::Arrow => {
                     // 绘制前固化为自由模式，保证坐标换算使用真实视图变换
                     ensure_free(&app);
