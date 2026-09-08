@@ -608,6 +608,8 @@ fn apply_load_result(app: &AppWindow, state: &Rc<RefCell<AppState>>, r: LoadResu
     app.set_current_row(current_row(&st));
     app.set_fit_mode(true);
     app.set_loading(false);
+    // 切图后回到指针态（不默认进入工具；用户需标注时再点工具按钮）
+    app.set_active_tool(-1);
     let name = std::path::Path::new(&r.path)
         .file_name()
         .map(|s| s.to_string_lossy().into_owned())
@@ -773,12 +775,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             st.interaction = Interaction::None;
             hide_previews(&app);
             hide_text_input(&app);
-            let msg = match Tool::from_id(app.get_active_tool()) {
-                Tool::Rect => "矩形工具：按住左键拖动画框（中键/右键拖动平移）",
-                Tool::Ellipse => "椭圆工具：按住左键拖动画框（中键/右键拖动平移）",
-                Tool::Arrow => "箭头工具：从起点拖到终点（中键/右键拖动平移）",
-                Tool::Pen => "画笔工具：按住左键手绘（中键/右键拖动平移）",
-                Tool::Text => "文字工具：点击画布放置文字（中键/右键拖动平移）",
+            let tid = app.get_active_tool();
+            let msg = if tid < 0 {
+                // 指针态：再点工具按钮或 Esc 退出工具后回到这里
+                "指针态 · 左键拖动平移（点工具按钮开始标注）"
+            } else {
+                match Tool::from_id(tid) {
+                    Tool::Rect => "矩形工具：按住左键拖动画框（中键/右键拖动平移）",
+                    Tool::Ellipse => "椭圆工具：按住左键拖动画框（中键/右键拖动平移）",
+                    Tool::Arrow => "箭头工具：从起点拖到终点（中键/右键拖动平移）",
+                    Tool::Pen => "画笔工具：按住左键手绘（中键/右键拖动平移）",
+                    Tool::Text => "文字工具：点击画布放置文字（中键/右键拖动平移）",
+                }
             };
             app.set_status(SharedString::from(msg));
         });
@@ -891,7 +899,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         });
     }
     {
-        // Esc 层级处理：关最近面板 > 取消文字输入 > 取消绘制 > 退出极简模式 > 提示
+        // Esc 层级处理：关最近面板 > 取消文字输入 > 取消绘制 > 退出当前工具 > 退出极简模式 > 提示
         let weak = app.as_weak();
         let state = state.clone();
         app.on_escape_pressed(move || {
@@ -910,12 +918,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 st.interaction = Interaction::None;
                 hide_previews(&app);
                 app.set_status(SharedString::from("已取消"));
+            } else if app.get_active_tool() >= 0 {
+                // 3. 工具已激活且无绘制 → 退出工具回指针态（再点当前按钮亦可）
+                app.set_active_tool(-1);
+                hide_text_input(&app);
+                app.set_status(SharedString::from("已退出工具 · 指针态（左键拖动平移）"));
             } else if app.get_minimal_mode() {
-                // 3. 极简模式且无绘制 → 退出极简
+                // 4. 极简模式且无绘制 → 退出极简
                 app.set_minimal_mode(false);
                 app.set_status(SharedString::from("已退出极简模式"));
             } else {
-                // 4. 完整模式无操作 → 提示入口
+                // 5. 完整模式无操作 → 提示入口
                 app.set_status(SharedString::from("极简模式: Ctrl+M"));
             }
         });
@@ -1135,7 +1148,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             };
             let cx = app.get_pointer_x();
             let cy = app.get_pointer_y();
-            // 中键(1)/右键(2) → 任意工具下平移（无需浏览工具）
+            // 中键(1)/右键(2) → 任意状态（指针/工具）下平移
             if app.get_pointer_button() != 0 {
                 ensure_free(&app);
                 // 拖动平移不应把输入框草稿误提交（锚点随视图偏移）
@@ -1147,9 +1160,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 app.set_status(SharedString::from("平移中 · 拖动移动画布"));
                 return;
             }
+            // 左键
+            let tid = app.get_active_tool();
+            if tid < 0 {
+                // 指针态（默认/切图后）：左键拖动 = 平移（无浏览按钮，指针即浏览）
+                ensure_free(&app);
+                if app.get_text_input_visible() {
+                    hide_text_input(&app);
+                }
+                hide_previews(&app);
+                st.interaction = Interaction::Panning { last: (cx, cy) };
+                app.set_status(SharedString::from("指针 · 拖动平移"));
+                return;
+            }
             // 输入框流转：文字工具下再次点击 = 先提交当前文字再开新框；
             // 其他工具下点击（含切工具回调） = 丢弃输入
-            let current_tool = Tool::from_id(app.get_active_tool());
+            let current_tool = Tool::from_id(tid);
             if app.get_text_input_visible() && current_tool != Tool::Text {
                 hide_text_input(&app);
             }

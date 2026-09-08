@@ -176,8 +176,9 @@ export component AppWindow inherits Window {
     in-out property <length> view-offset-y: 0px;
     // true=自适应模式；false=自由模式
     in-out property <bool> fit-mode: true;
-    // 当前工具：0=矩形 1=椭圆 2=箭头 3=画笔 4=文字（无浏览；平移=任意工具下中/右键拖动）
-    in-out property <int> active-tool: 0;
+    // 当前工具：-1=指针态(默认/切图后；左键拖动平移) 0=矩形 1=椭圆 2=箭头 3=画笔 4=文字
+    // 标注工具下平移 = 中键/右键拖动；退出工具 = 再点当前按钮 / Esc
+    in-out property <int> active-tool: -1;
     // 极简模式：隐藏工具条/状态栏，仅画布 + 全键盘操作（Ctrl+M 切换）
     in-out property <bool> minimal-mode: false;
     // 极简模式提示条可见（进入极简时点亮，3 秒后 Rust 熄灭）
@@ -278,23 +279,48 @@ export component AppWindow inherits Window {
             spacing: 4px;
             Button {
                 text: "矩形";
-                clicked => { root.active-tool = 0; root.tool-changed(); canvas-fs.focus(); }
+                checked: root.active-tool == 0;
+                clicked => {
+                    root.active-tool = root.active-tool == 0 ? -1 : 0;
+                    root.tool-changed();
+                    canvas-fs.focus();
+                }
             }
             Button {
                 text: "椭圆";
-                clicked => { root.active-tool = 1; root.tool-changed(); canvas-fs.focus(); }
+                checked: root.active-tool == 1;
+                clicked => {
+                    root.active-tool = root.active-tool == 1 ? -1 : 1;
+                    root.tool-changed();
+                    canvas-fs.focus();
+                }
             }
             Button {
                 text: "箭头";
-                clicked => { root.active-tool = 2; root.tool-changed(); canvas-fs.focus(); }
+                checked: root.active-tool == 2;
+                clicked => {
+                    root.active-tool = root.active-tool == 2 ? -1 : 2;
+                    root.tool-changed();
+                    canvas-fs.focus();
+                }
             }
             Button {
                 text: "画笔";
-                clicked => { root.active-tool = 3; root.tool-changed(); canvas-fs.focus(); }
+                checked: root.active-tool == 3;
+                clicked => {
+                    root.active-tool = root.active-tool == 3 ? -1 : 3;
+                    root.tool-changed();
+                    canvas-fs.focus();
+                }
             }
             Button {
                 text: "文字";
-                clicked => { root.active-tool = 4; root.tool-changed(); canvas-fs.focus(); }
+                checked: root.active-tool == 4;
+                clicked => {
+                    root.active-tool = root.active-tool == 4 ? -1 : 4;
+                    root.tool-changed();
+                    canvas-fs.focus();
+                }
             }
             Rectangle { width: 8px; }
             Button {
