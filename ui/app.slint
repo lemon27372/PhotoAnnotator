@@ -100,6 +100,7 @@ component GridCell {
     in property <int> gidx;
     in property <int> current-row: -1;
     callback clicked;
+    callback rename-clicked;
     // 行内三等分（父为行内 HorizontalLayout）
     horizontal-stretch: 1;
     Rectangle {
@@ -112,6 +113,12 @@ component GridCell {
         TouchArea {
             enabled: root.entry.kind >= 0;
             clicked => { root.clicked(); }
+            // 右键格 = 重命名
+            pointer-event(event) => {
+                if event.button == PointerEventButton.right && event.kind == PointerEventKind.down {
+                    root.rename-clicked();
+                }
+            }
         }
         // Tooltip 须声明在 TouchArea 之后（顶层）才能收到 hover；TooltipArea 不消费事件，点击穿透到 TouchArea
         if root.entry.kind >= 0: Tooltip {
@@ -294,6 +301,14 @@ export component AppWindow inherits Window {
     // ←/→：切换上一张/下一张图片（极简模式下浏览工作目录图片）
     callback prev-image;
     callback next-image;
+    // 重命名图片文件：右键条目发起 → 浮层输入新名（Enter/确定确认，Esc/取消放弃）
+    in-out property <bool> rename-visible: false;
+    in-out property <string> rename-title: "重命名图片";
+    in-out property <string> rename-draft: "";
+    in-out property <int> clicked-rename-file: -1;
+    callback rename-row;
+    callback rename-confirm;
+    callback rename-cancel;
 
     VerticalLayout {
         // ---- 工具条（极简模式：if 条件渲染——hidden 元素仍占布局，须彻底移除）----
@@ -499,6 +514,14 @@ export component AppWindow inherits Window {
                                     root.select-file();
                                     canvas-fs.focus();
                                 }
+                                // 右键图片行 = 重命名（打开浮层并聚焦输入框）
+                                pointer-event(event) => {
+                                    if event.button == PointerEventButton.right && event.kind == PointerEventKind.down {
+                                        root.clicked-rename-file = idx;
+                                        root.rename-row();
+                                        rename-scope.focus();
+                                    }
+                                }
                                 // 内容垂直居中（行高 46）
                                 VerticalLayout {
                                     width: 100%;
@@ -576,9 +599,9 @@ export component AppWindow inherits Window {
                                 padding-left: 4px;
                                 padding-right: 4px;
                                 spacing: 6px;
-                                GridCell { entry: row.c0; gidx: ri * 3 + 0; current-row: root.current-row; clicked => { root.clicked-file = self.gidx; root.select-file(); canvas-fs.focus(); } }
-                                GridCell { entry: row.c1; gidx: ri * 3 + 1; current-row: root.current-row; clicked => { root.clicked-file = self.gidx; root.select-file(); canvas-fs.focus(); } }
-                                GridCell { entry: row.c2; gidx: ri * 3 + 2; current-row: root.current-row; clicked => { root.clicked-file = self.gidx; root.select-file(); canvas-fs.focus(); } }
+                                GridCell { entry: row.c0; gidx: ri * 3 + 0; current-row: root.current-row; clicked => { root.clicked-file = self.gidx; root.select-file(); canvas-fs.focus(); } rename-clicked => { root.clicked-rename-file = self.gidx; root.rename-row(); rename-scope.focus(); } }
+                                GridCell { entry: row.c1; gidx: ri * 3 + 1; current-row: root.current-row; clicked => { root.clicked-file = self.gidx; root.select-file(); canvas-fs.focus(); } rename-clicked => { root.clicked-rename-file = self.gidx; root.rename-row(); rename-scope.focus(); } }
+                                GridCell { entry: row.c2; gidx: ri * 3 + 2; current-row: root.current-row; clicked => { root.clicked-file = self.gidx; root.select-file(); canvas-fs.focus(); } rename-clicked => { root.clicked-rename-file = self.gidx; root.rename-row(); rename-scope.focus(); } }
                             }
                         }
                     }
@@ -872,6 +895,53 @@ export component AppWindow inherits Window {
                         font-size: 12px;
                         color: #757575;
                     }
+                }
+            }
+        }
+    }
+
+    // ---- 重命名图片浮层（声明在布局后 → 顶层；Enter/确定确认，Esc/取消关闭）----
+    rename-dialog := Rectangle {
+        visible: root.rename-visible;
+        x: (root.width - 340px) / 2;
+        y: (root.height - 140px) / 2;
+        width: 340px;
+        height: 132px;
+        background: #FFFFFF;
+        border-radius: 8px;
+        border-width: 1px;
+        border-color: #4A90D9;
+        VerticalLayout {
+            padding-left: 12px;
+            padding-right: 12px;
+            padding-top: 10px;
+            padding-bottom: 10px;
+            spacing: 8px;
+            Text {
+                text: root.rename-title;
+                font-size: 13px;
+                font-weight: 600;
+                color: #212121;
+            }
+            // 输入焦点作用域：forward 到输入框；Esc 取消（不依赖画布快捷键层）
+            rename-scope := FocusScope {
+                forward-focus: rename-input;
+                KeyBinding { keys: @keys(Escape); activated => { root.rename-cancel(); canvas-fs.focus(); } }
+                rename-input := InlineTextInput {
+                    text <=> root.rename-draft;
+                    accepted => { root.rename-confirm(); canvas-fs.focus(); }
+                }
+            }
+            HorizontalLayout {
+                alignment: end;
+                spacing: 8px;
+                Button {
+                    text: "确定";
+                    clicked => { root.rename-confirm(); canvas-fs.focus(); }
+                }
+                Button {
+                    text: "取消";
+                    clicked => { root.rename-cancel(); canvas-fs.focus(); }
                 }
             }
         }

@@ -145,6 +145,30 @@ pub fn set_file_status(workspace_id: i64, path: &str, status: &str) {
     }
 }
 
+/// 重命名文件记录（磁盘已改名后同步 DB；file_id 不变，annotations/thumbnails 关联保持）
+pub fn rename_file(file_id: i64, new_path: &str) {
+    if let Ok(conn) = open() {
+        let _ = conn.execute(
+            "UPDATE files SET path = ?1 WHERE id = ?2",
+            rusqlite::params![new_path, file_id],
+        );
+    }
+}
+
+/// 删除文件标注 JSON（覆盖保存后标注已烧入原图，清空避免重载双重显示）
+pub fn clear_annotations(file_id: i64) {
+    if let Ok(conn) = open() {
+        let _ = conn.execute("DELETE FROM annotations WHERE file_id = ?1", [file_id]);
+    }
+}
+
+/// 删除缩略图缓存（覆盖保存后图片内容已变，强制下次重建）
+pub fn delete_thumbnail(file_id: i64) {
+    if let Ok(conn) = open() {
+        let _ = conn.execute("DELETE FROM thumbnails WHERE file_id = ?1", [file_id]);
+    }
+}
+
 /// 保存标注 JSON（覆盖式 upsert）
 pub fn save_annotations(file_id: i64, json: &str) {
     if let Ok(conn) = open() {

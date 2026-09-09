@@ -201,6 +201,10 @@ struct AppState {
     /// 双击检测：上一次点击的列表行（-1 无）与时刻（ns）
     last_click_row: i32,
     last_click_at: u128,
+    /// 重命名进行中：待改名图片的旧绝对路径与图片索引（右键发起，确认时消费）
+    rename_pending: Option<(String, usize)>,
+    /// 覆盖保存进行中（防重复触发；后台合成/编码期间标志置位）
+    save_pending: bool,
 }
 
 impl AppState {
@@ -223,21 +227,88 @@ impl AppState {
             thumb_cache: Vec::new(),
             last_click_row: -1,
             last_click_at: 0,
+            rename_pending: None,
+            save_pending: false,
         }
     }
 }
 
-/// 保存输出路径：原图同目录 + `_annotated.png`
-fn annotated_save_path(original: Option<&str>) -> String {
-    match original {
-        Some(p) => {
-            let path = std::path::Path::new(p);
-            let stem = path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| "image".into());
-            let dir = path.parent().unwrap_or_else(|| std::path::Path::new("."));
-            dir.join(format!("{stem}_annotated.png")).to_string_lossy().into_owned()
-        }
-        None => "annotated.png".to_string(),
+// ---------- 覆盖保存（2026-09-09 起：Ctrl+S 直接写回原图，不再另存 _annotated.png） ----------
+
+/// 按原文件格式编码合成 RGBA（PNG 保留 alpha，其余格式转 RGB 丢弃透明）
+fn encode_rgba_by_format(w: u32, h: u32, rgba: &[u8], path: &str) -> Option<Vec<u8>> {
+    let img = image::RgbaImage::from_raw(w, h, rgba.to_vec())?;
+    let dyn_img = image::DynamicImage::ImageRgba8(img);
+    let mut buf = std::io::Cursor::new(Vec::new());
+    let fmt = image::ImageFormat::from_path(path).unwrap_or(image::ImageFormat::Png);
+    match fmt {
+        image::ImageFormat::Png => dyn_img.write_to(&mut buf, fmt).ok()?,
+        _ => dyn_img.to_rgb8().write_to(&mut buf, fmt).ok()?,
     }
+    Some(buf.into_inner())
+}
+
+/// 原子替换写文件（临时文件 + 覆盖），避免写坏原图
+fn replace_file(path: &str, bytes: &[u8]) -> std::io::Result<()> {
+    let p = std::path::Path::new(path);
+    let tmp = p.with_file_name(format!(
+        ".{}.pa-tmp",
+        p.file_name().map(|s| s.to_string_lossy()).unwrap_or_default()
+    ));
+    std::fs::write(&tmp, bytes)?;
+    if p.exists() {
+        std::fs::remove_file(p)?;
+    }
+    std::fs::rename(&tmp, p)?;
+    Ok(())
+}
+
+/// 校验并合成重命名目标绝对路径：非法字符/空名/保留名拒绝；扩展名须与原一致（未输入自动补）
+fn validate_rename(new_name: &str, old_path: &str) -> Result<String, String> {
+    let old = std::path::Path::new(old_path);
+    let old_ext = old.extension().and_then(|e| e.to_str()).unwrap_or("").to_string();
+    let dir = old.parent().unwrap_or_else(|| std::path::Path::new("."));
+    let new_name = new_name.trim();
+    if new_name.is_empty() {
+        return Err("文件名不能为空".into());
+    }
+    if new_name == "." || new_name == ".." {
+        return Err("文件名不合法".into());
+    }
+    if new_name.chars().any(|c| matches!(c, '\\' | '/' | ':' | '*' | '?' | '"' | '<' | '>' | '|')) {
+        return Err("文件名包含非法字符（\\ / : * ? \" < > |）".into());
+    }
+    // 提取主名与扩展名（仅最后一段点视为扩展）
+    let (base, ext) = match new_name.rsplit_once('.') {
+        Some((b, e)) if !b.is_empty() && !e.is_empty() => (b.to_string(), e.to_string()),
+        _ => (new_name.to_string(), String::new()),
+    };
+    let target_name = if ext.is_empty() {
+        if old_ext.is_empty() {
+            base
+        } else {
+            format!("{base}.{old_ext}")
+        }
+    } else if ext.eq_ignore_ascii_case(&old_ext) {
+        format!("{base}.{ext}")
+    } else {
+        return Err(format!("扩展名不可修改（当前为 .{old_ext}）"));
+    };
+    let target_path = dir.join(&target_name);
+    if target_path.exists() {
+        return Err("同名文件已存在".into());
+    }
+    Ok(target_path.to_string_lossy().into_owned())
+}
+
+/// 侧边栏行号 → 图片索引（目录行返回 None）
+fn row_to_image(st: &AppState, row: i64) -> Option<usize> {
+    let d = st.dirs.len() as i64;
+    if row < d {
+        return None;
+    }
+    let i = (row - d) as usize;
+    (i < st.files.len()).then_some(i)
 }
 
 // ---------- 工作目录（第三阶段 P1+P2） ----------
@@ -456,6 +527,20 @@ struct LoadResult {
     decoded: Result<(u32, u32, Vec<u8>), String>,
 }
 
+/// 后台覆盖保存完成通知（Send，可跨线程排队）
+struct SaveOutcome {
+    /// 保存的目标原图路径
+    path: String,
+    /// 保存发起时的 file id（收尾清 DB 标注/缩略图用）
+    file_id: i64,
+    /// 保存发起时的 workspace id（置 done 用）
+    workspace_id: i64,
+    /// 发起时标注条数（成功收尾时从标注层剥离本次已烧录段）
+    n0: usize,
+    /// Ok(合成后 RGBA 基底) / Err(失败描述)
+    result: Result<Vec<u8>, String>,
+}
+
 /// 解码完成的图片数据（缓存单元）
 struct Decoded {
     w: u32,
@@ -665,6 +750,53 @@ fn step_image(
     load_image_by_index(app, state, target as usize, load_seq, queue, cache, tip_timer);
 }
 
+/// 覆盖保存收尾（主线程轮询队列时调用）：应用合成基底、剥离已烧录标注、清 DB、刷新列表
+fn finish_save(app: &AppWindow, state: &Rc<RefCell<AppState>>, out: SaveOutcome) {
+    let mut st = state.borrow_mut();
+    st.save_pending = false;
+    match out.result {
+        Ok(rgba) => {
+            // 仅当当前显示仍是该文件时才动内存基底/标注层
+            if st.image_path.as_deref() == Some(out.path.as_str()) {
+                st.image_rgba = rgba;
+                // 剥离本次已烧录的标注段（保留保存期间用户新增的 Δ）
+                let items = st.store.items.clone();
+                if items.len() >= out.n0 {
+                    st.store.set_items(items[out.n0..].to_vec());
+                }
+                // 保存=提交点：撤销历史清空（原图已覆盖，不应能撤销回保存前）
+                st.store.clear_history();
+                update_overlay(app, &st);
+                let ci = st.current_index;
+                if ci >= 0 && (ci as usize) < st.thumb_cache.len() {
+                    st.thumb_cache[ci as usize] = None;
+                }
+            } else {
+                // 已切到其它图：清该文件的缩略图内存缓存项（内容已变）
+                let hit = st.files.iter().position(|f| *f == out.path);
+                if let Some(i) = hit {
+                    if i < st.thumb_cache.len() {
+                        st.thumb_cache[i] = None;
+                    }
+                }
+            }
+            if out.file_id >= 0 {
+                storage::db::clear_annotations(out.file_id);
+                storage::db::delete_thumbnail(out.file_id);
+            }
+            if out.workspace_id >= 0 {
+                storage::db::set_file_status(out.workspace_id, &out.path, "done");
+            }
+            rebuild_sidebar(app, &mut st);
+            app.set_status(SharedString::from(format!("已保存（覆盖原图）: {}", out.path)));
+        }
+        Err(e) => {
+            // 失败：DB 标注（发起时已 persist）保留，标注层未动，可再次保存
+            app.set_status(SharedString::from(format!("保存失败: {e}")));
+        }
+    }
+}
+
 /// 应用一次加载结果（主线程 Timer 轮询队列时调用）
 fn apply_load_result(
     app: &AppWindow,
@@ -811,6 +943,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let load_queue: Arc<Mutex<Vec<LoadResult>>> = Arc::new(Mutex::new(Vec::new()));
     let decode_cache: Arc<Mutex<HashMap<usize, Arc<Decoded>>>> =
         Arc::new(Mutex::new(HashMap::new()));
+    // 覆盖保存完成队列（合成/编码/写文件在后台线程，结果回主线程收尾）
+    let save_queue: Arc<Mutex<Vec<SaveOutcome>>> = Arc::new(Mutex::new(Vec::new()));
     // 极简模式提示条 3 秒熄灭计时器（进入极简 / 极简下切图共用）
     let tip_timer = Rc::new(RefCell::new(Timer::default()));
     // 极简模式窗口尺寸记录（进入时保存，退出恢复）
@@ -927,9 +1061,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         });
     }
     {
-        // 保存：合成标注到原图 → PNG；保存=提交点，撤销历史清空
+        // 保存（2026-09-09 起覆盖原图）：合成/编码/写文件在后台线程，避免主线程卡顿
+        // 发起时先把本次标注持久化（后台期间切图不丢）；完成后主线程收尾（烧录剥离/DB 清理/刷新）
         let weak = app.as_weak();
         let state = state.clone();
+        let save_queue = save_queue.clone();
         app.on_save(move || {
             let (Some(app), mut st) = (weak.upgrade(), state.borrow_mut()) else {
                 return;
@@ -938,36 +1074,44 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 app.set_status(SharedString::from("没有可保存的图片"));
                 return;
             }
-            let Some(png) = canvas::overlay::composite_png(
-                st.image_width,
-                st.image_height,
-                &st.image_rgba,
-                &st.store,
-            ) else {
-                app.set_status(SharedString::from("合成失败"));
+            let Some(path) = st.image_path.clone() else {
+                app.set_status(SharedString::from("当前图片没有可写回的文件路径"));
                 return;
             };
-            let out_path = annotated_save_path(st.image_path.as_deref());
-            match std::fs::write(&out_path, png) {
-                Ok(_) => {
-                    st.store.clear_history();
-                    let n = st.store.len();
-                    // 工作目录模式：标注已保存 → 状态置 done 并刷新列表
-                    if st.workspace_id >= 0 {
-                        if let Some(p) = st.image_path.clone() {
-                            storage::db::set_file_status(st.workspace_id, &p, "done");
-                            persist_current(&mut st);
-                            rebuild_sidebar(&app, &mut st);
-                        }
-                    }
-                    app.set_status(SharedString::from(format!(
-                        "已保存: {out_path}（{n} 个标注，撤销历史已重置）"
-                    )));
-                }
-                Err(e) => {
-                    app.set_status(SharedString::from(format!("保存失败: {e}")));
-                }
+            if st.save_pending {
+                app.set_status(SharedString::from("正在保存…请稍候"));
+                return;
             }
+            // 快照（Send）：标注条目 + 原图 RGBA + 尺寸
+            let n0 = st.store.len();
+            let items = st.store.items.clone();
+            let bg = st.image_rgba.clone();
+            let (w, h) = (st.image_width, st.image_height);
+            let file_id = st.file_id;
+            let workspace_id = st.workspace_id;
+            // 持久化本次标注：后台保存期间切图不丢（成功后收尾会清）
+            if file_id >= 0 {
+                storage::db::save_annotations(file_id, &st.store.to_json());
+            }
+            st.save_pending = true;
+            app.set_status(SharedString::from("保存中…"));
+            // 后台线程：合成 → 按原格式编码 → 原子写回原文件
+            let queue = save_queue.clone();
+            std::thread::spawn(move || {
+                let mut tmp = AnnotationStore::new();
+                tmp.set_items(items);
+                let result = (|| {
+                    let rgba = canvas::overlay::composite_rgba(w, h, &bg, &tmp)
+                        .ok_or_else(|| "合成失败".to_string())?;
+                    let bytes = encode_rgba_by_format(w, h, &rgba, &path)
+                        .ok_or_else(|| "编码失败：该图片格式不支持覆盖保存".to_string())?;
+                    replace_file(&path, &bytes).map_err(|e| e.to_string())?;
+                    Ok(rgba)
+                })();
+                if let Ok(mut q) = queue.lock() {
+                    q.push(SaveOutcome { path, file_id, workspace_id, n0, result });
+                }
+            });
         });
     }
     {
@@ -1016,36 +1160,40 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         });
     }
     {
-        // Esc 层级处理：关最近面板 > 取消文字输入 > 取消绘制 > 退出当前工具 > 退出极简模式 > 提示
+        // Esc 层级处理：关重命名浮层 > 关最近面板 > 取消文字输入 > 取消绘制 > 退出当前工具 > 退出极简模式 > 提示
         let weak = app.as_weak();
         let state = state.clone();
         app.on_escape_pressed(move || {
             let (Some(app), mut st) = (weak.upgrade(), state.borrow_mut()) else {
                 return;
             };
-            if app.get_recent_visible() {
-                // 0. 最近工作区面板打开 → 关闭
+            if app.get_rename_visible() {
+                // 0. 重命名浮层打开 → 关闭（丢弃草稿）
+                app.set_rename_visible(false);
+                st.rename_pending = None;
+            } else if app.get_recent_visible() {
+                // 1. 最近工作区面板打开 → 关闭
                 app.set_recent_visible(false);
             } else if app.get_text_input_visible() {
-                // 1. 文字输入中 → 取消输入
+                // 2. 文字输入中 → 取消输入
                 hide_text_input(&app);
                 app.set_status(SharedString::from("已取消文字输入"));
             } else if !matches!(st.interaction, Interaction::None) {
-                // 2. 有绘制/平移进行中 → 取消
+                // 3. 有绘制/平移进行中 → 取消
                 st.interaction = Interaction::None;
                 hide_previews(&app);
                 app.set_status(SharedString::from("已取消"));
             } else if app.get_active_tool() >= 0 {
-                // 3. 工具已激活且无绘制 → 退出工具回指针态（再点当前按钮亦可）
+                // 4. 工具已激活且无绘制 → 退出工具回指针态（再点当前按钮亦可）
                 app.set_active_tool(-1);
                 hide_text_input(&app);
                 app.set_status(SharedString::from("已退出工具 · 指针态（左键拖动平移）"));
             } else if app.get_minimal_mode() {
-                // 4. 极简模式且无绘制 → 退出极简
+                // 5. 极简模式且无绘制 → 退出极简
                 app.set_minimal_mode(false);
                 app.set_status(SharedString::from("已退出极简模式"));
             } else {
-                // 5. 完整模式无操作 → 提示入口
+                // 6. 完整模式无操作 → 提示入口
                 app.set_status(SharedString::from("极简模式: Ctrl+M"));
             }
         });
@@ -1287,6 +1435,88 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             step_image(&app, &state, 1, &load_seq, &load_queue, &decode_cache, &tip_timer);
         });
     }
+    {
+        // 右键图片行（列表/网格）→ 打开重命名浮层（预填当前文件名）
+        let weak = app.as_weak();
+        let state = state.clone();
+        app.on_rename_row(move || {
+            let (Some(app), mut st) = (weak.upgrade(), state.borrow_mut()) else {
+                return;
+            };
+            let row = app.get_clicked_rename_file();
+            if row < 0 {
+                return;
+            }
+            let Some(img_idx) = row_to_image(&st, row as i64) else {
+                app.set_status(SharedString::from("子目录不支持重命名"));
+                return;
+            };
+            let old = st.files[img_idx].clone();
+            let fname = std::path::Path::new(&old)
+                .file_name()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_else(|| old.clone());
+            st.rename_pending = Some((old, img_idx));
+            app.set_rename_title(SharedString::from(format!("重命名: {fname}")));
+            app.set_rename_draft(SharedString::from(fname));
+            app.set_rename_visible(true);
+        });
+    }
+    {
+        // 确定 / Enter：磁盘改名 + 同步 DB/列表状态
+        let weak = app.as_weak();
+        let state = state.clone();
+        app.on_rename_confirm(move || {
+            let (Some(app), mut st) = (weak.upgrade(), state.borrow_mut()) else {
+                return;
+            };
+            app.set_rename_visible(false);
+            let Some((old, img_idx)) = st.rename_pending.take() else {
+                return;
+            };
+            let draft = app.get_rename_draft().to_string();
+            let new_path = match validate_rename(&draft, &old) {
+                Ok(p) => p,
+                Err(e) => {
+                    app.set_status(SharedString::from(e));
+                    return;
+                }
+            };
+            if new_path == old {
+                app.set_status(SharedString::from("名称未变化"));
+                return;
+            }
+            if let Err(e) = std::fs::rename(&old, &new_path) {
+                app.set_status(SharedString::from(format!("重命名失败: {e}")));
+                return;
+            }
+            // 同步内存列表与 DB（file_id 不变，标注/缩略图关联保持）
+            if img_idx < st.files.len() {
+                st.files[img_idx] = new_path.clone();
+            }
+            if let Some(&fid) = st.file_ids.get(img_idx).filter(|f| **f >= 0) {
+                storage::db::rename_file(fid, &new_path);
+            }
+            // 当前显示的就是该文件 → 更新路径，后续覆盖保存写新路径
+            if st.current_index == img_idx as i64 {
+                st.image_path = Some(new_path.clone());
+            }
+            rebuild_sidebar(&app, &mut st);
+            app.set_status(SharedString::from(format!("已重命名: {new_path}")));
+        });
+    }
+    {
+        // 取消 / Esc：关闭浮层并丢弃挂起状态
+        let weak = app.as_weak();
+        let state = state.clone();
+        app.on_rename_cancel(move || {
+            let (Some(app), mut st) = (weak.upgrade(), state.borrow_mut()) else {
+                return;
+            };
+            app.set_rename_visible(false);
+            st.rename_pending = None;
+        });
+    }
 
     // 5. 指针交互回调（按下/拖动/释放，按当前工具分发）
     {
@@ -1472,13 +1702,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         });
     }
 
-    // 7. 异步加载结果轮询：主线程应用解码完成的切图（过期序号丢弃）
+    // 7. 异步轮询（主线程）：切图解码结果应用（过期序号丢弃）+ 覆盖保存结果收尾
     let load_timer = Timer::default();
     {
         let weak = app.as_weak();
         let state = state.clone();
         let load_seq = load_seq.clone();
         let load_queue = load_queue.clone();
+        let save_queue = save_queue.clone();
         let tip_timer = tip_timer.clone();
         load_timer.start(TimerMode::Repeated, Duration::from_millis(80), move || {
             // 取出队列中最新一条未过期结果应用
@@ -1500,6 +1731,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             if let Some(r) = result {
                 if let Some(app) = weak.upgrade() {
                     apply_load_result(&app, &state, r, &tip_timer);
+                }
+            }
+            // 保存结果收尾（每次取最新一条）
+            let save_out: Option<SaveOutcome> = {
+                let mut q = match save_queue.lock() {
+                    Ok(q) => q,
+                    Err(_) => return,
+                };
+                q.pop()
+            };
+            if let Some(out) = save_out {
+                if let Some(app) = weak.upgrade() {
+                    finish_save(&app, &state, out);
                 }
             }
         });

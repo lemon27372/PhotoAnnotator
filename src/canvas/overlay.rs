@@ -63,17 +63,7 @@ pub fn composite_to_pixmap(
     Some(pixmap)
 }
 
-/// 合成 → PNG 字节（保存文件用）
-pub fn composite_png(
-    width: u32,
-    height: u32,
-    background_rgba: &[u8],
-    store: &AnnotationStore,
-) -> Option<Vec<u8>> {
-    composite_to_pixmap(width, height, background_rgba, store)?.encode_png().ok()
-}
-
-/// 合成 → straight-alpha RGBA 字节（剪贴板粘贴用，arboard 期望 straight）
+/// 合成 → straight-alpha RGBA 字节（剪贴板粘贴/覆盖保存用）
 pub fn composite_rgba(
     width: u32,
     height: u32,
