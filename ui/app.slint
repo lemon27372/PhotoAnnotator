@@ -201,11 +201,12 @@ export component AppWindow inherits Window {
     // 当前工具：-1=指针态(默认/切图后；左键拖动平移) 0=矩形 1=椭圆 2=箭头 3=画笔 4=文字
     // 标注工具下平移 = 中键/右键拖动；退出工具 = 再点当前按钮 / Esc
     in-out property <int> active-tool: -1;
-    // 极简模式：隐藏工具条/状态栏，仅画布 + 全键盘操作（Ctrl+M 切换）
+    // 极简模式：隐藏工具条/侧边栏/状态栏，仅画布 + 全键盘操作（Ctrl+M 切换）
     in-out property <bool> minimal-mode: false;
-    // 极简模式提示条可见（进入极简时点亮，3 秒后 Rust 熄灭）
+    // 极简模式提示条可见（进入极简/切图时点亮，3 秒后 Rust 熄灭）
     in-out property <bool> minimal-tip-visible: true;
-    property <string> minimal-tip: "极简模式 · Ctrl+M 退出 · Esc 取消/退出";
+    // 提示条文本（进入极简/极简下切图的序号反馈）
+    in-out property <string> minimal-tip: "极简模式 · Ctrl+M 退出 · Esc 取消/退出 · ←/→ 切图";
 
     // ---- 绘制中预览 ----
     // 矩形预览（原生 Rectangle，拖动流畅）
@@ -290,11 +291,13 @@ export component AppWindow inherits Window {
     callback pointer-down;
     callback pointer-move;
     callback pointer-up;
+    // ←/→：切换上一张/下一张图片（极简模式下浏览工作目录图片）
+    callback prev-image;
+    callback next-image;
 
     VerticalLayout {
-        // ---- 工具条（极简模式隐藏）----
-        HorizontalLayout {
-            visible: !root.minimal-mode;
+        // ---- 工具条（极简模式：if 条件渲染——hidden 元素仍占布局，须彻底移除）----
+        if !root.minimal-mode: HorizontalLayout {
             height: 36px;
             padding-left: 8px;
             padding-right: 8px;
@@ -380,9 +383,8 @@ export component AppWindow inherits Window {
             padding-right: 8px;
             padding-bottom: 8px;
 
-            // ---- 工作目录侧边栏（极简模式隐藏）----
-            workspace-side := Rectangle {
-                visible: !root.minimal-mode;
+            // ---- 工作目录侧边栏（极简模式：if 条件渲染，画布才可扩展占满）----
+            if !root.minimal-mode: workspace-side := Rectangle {
                 width: 236px;
                 background: #FFFFFF;
                 border-radius: 6px;
@@ -674,6 +676,9 @@ export component AppWindow inherits Window {
                 KeyBinding { enabled: !root.text-input-visible; keys: @keys(Control+C); activated => { root.copy(); } }
                 KeyBinding { enabled: !root.text-input-visible; keys: @keys(Control+S); activated => { root.save(); } }
                 KeyBinding { enabled: !root.text-input-visible; keys: @keys(Control+M); activated => { root.toggle-minimal(); } }
+                // ←/→ 切图（文字输入时不劫持光标移动）
+                KeyBinding { enabled: !root.text-input-visible; keys: @keys(LeftArrow); activated => { root.prev-image(); } }
+                KeyBinding { enabled: !root.text-input-visible; keys: @keys(RightArrow); activated => { root.next-image(); } }
                 // Esc 保持可用：取消文字输入/绘制/退出极简
                 KeyBinding { keys: @keys(Escape); activated => { root.escape-pressed(); } }
 
@@ -848,9 +853,8 @@ export component AppWindow inherits Window {
         }
         } // <- canvas-area 包裹的 HorizontalLayout 闭合
 
-        // ---- 状态栏（极简模式隐藏）----
-        HorizontalLayout {
-            visible: !root.minimal-mode;
+        // ---- 状态栏（极简模式：if 条件渲染，不残留底部占位）----
+        if !root.minimal-mode: HorizontalLayout {
             Rectangle {
                 height: 32px;
                 background: #FFFFFF;

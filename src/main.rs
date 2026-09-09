@@ -492,6 +492,7 @@ fn load_image_by_index(
     load_seq: &Arc<AtomicU32>,
     queue: &Arc<Mutex<Vec<LoadResult>>>,
     cache: &Arc<Mutex<HashMap<usize, Arc<Decoded>>>>,
+    tip_timer: &Rc<RefCell<Timer>>,
 ) {
     // 阶段 1（借用 state）：持久化旧标注 + 清理 + 提示加载中
     let (path, workspace_id, current_index) = {
@@ -524,6 +525,7 @@ fn load_image_by_index(
                 workspace_id,
                 decoded: Ok((dec.w, dec.h, dec.rgba.clone())),
             },
+            tip_timer,
         );
         // 命中后仍预取相邻图片（±2）
         let files = state.borrow().files.clone();
@@ -565,8 +567,111 @@ fn load_image_by_index(
     }
 }
 
+/// 屏幕物理可用尺寸（主屏；非 Windows/失败时回退 1920x1080）
+fn screen_work_area_phys() -> (u32, u32) {
+    #[cfg(target_os = "windows")]
+    {
+        #[link(name = "user32")]
+        unsafe extern "system" {
+            fn GetSystemMetrics(nIndex: i32) -> i32;
+        }
+        const SM_CXSCREEN: i32 = 0;
+        const SM_CYSCREEN: i32 = 1;
+        unsafe {
+            let w = GetSystemMetrics(SM_CXSCREEN);
+            let h = GetSystemMetrics(SM_CYSCREEN);
+            if w > 0 && h > 0 {
+                return (w as u32, h as u32);
+            }
+        }
+    }
+    (1920, 1080)
+}
+
+/// 极简模式进入：把窗口贴合到当前图片（client ≈ 图片 + 画布留边；保持比例，不超屏幕 95%）
+fn minimal_fit_window(app: &AppWindow) {
+    let iw = app.get_image_width(); // 图片宽（本项目以逻辑长度承载原图像素）
+    let ih = app.get_image_height();
+    if iw <= 0.0 || ih <= 0.0 {
+        return; // 无图不调整
+    }
+    let sf = app.window().scale_factor().max(0.1);
+    let (sw, sh) = screen_work_area_phys();
+    // 极简模式仅画布（主体左右 padding 8*2 + 画布边框 1*2 ≈ 18 逻辑 px 留白）
+    let pad = 18.0_f32;
+    let (mut w, mut h) = (iw + pad, ih + pad);
+    let (maxw, maxh) = (sw as f32 * 0.95 / sf, sh as f32 * 0.95 / sf);
+    let sc = (maxw / w).min(maxh / h).min(1.0);
+    w *= sc;
+    h *= sc;
+    let (w, h) = (w.max(240.0), h.max(180.0));
+    app.window().set_size(slint::LogicalSize::new(w, h));
+}
+
+/// 极简模式退出：恢复进入前的窗口尺寸
+fn minimal_restore_window(app: &AppWindow, restore: Option<(u32, u32)>) {
+    if let Some((w, h)) = restore {
+        app.window().set_size(slint::PhysicalSize::new(w, h));
+    }
+}
+
+/// 点亮极简提示条（文本 + 3 秒后自动熄灭；进入极简/极简下切图反馈共用）
+fn flash_tip(app: &AppWindow, tip_timer: &Rc<RefCell<Timer>>, msg: &str) {
+    app.set_minimal_tip(SharedString::from(msg));
+    app.set_minimal_tip_visible(true);
+    let weak = app.as_weak();
+    let timer = tip_timer.clone();
+    timer.borrow().stop();
+    timer.borrow().start(TimerMode::SingleShot, Duration::from_millis(3000), move || {
+        if let Some(app) = weak.upgrade() {
+            app.set_minimal_tip_visible(false);
+        }
+    });
+}
+
+/// ←/→ 键：在当前浏览目录的图片列表内切换上一张/下一张（异步加载，先持久化旧标注）
+fn step_image(
+    app: &AppWindow,
+    state: &Rc<RefCell<AppState>>,
+    dir: i64,
+    load_seq: &Arc<AtomicU32>,
+    queue: &Arc<Mutex<Vec<LoadResult>>>,
+    cache: &Arc<Mutex<HashMap<usize, Arc<Decoded>>>>,
+    tip_timer: &Rc<RefCell<Timer>>,
+) {
+    let (len, ci) = {
+        let st = state.borrow();
+        (st.files.len(), st.current_index)
+    };
+    if len == 0 {
+        app.set_status(SharedString::from("当前目录没有图片（工作目录内按 ←/→ 切图）"));
+        return;
+    }
+    let target: i64 = if ci < 0 {
+        // 尚无当前图（空态/加载中）：→ 从第一张起，← 从最后一张起
+        if dir > 0 {
+            0
+        } else {
+            len as i64 - 1
+        }
+    } else {
+        (ci + dir).clamp(0, len as i64 - 1)
+    };
+    if ci >= 0 && target == ci {
+        let msg = if dir > 0 { "已是最后一张" } else { "已是第一张" };
+        app.set_status(SharedString::from(msg));
+        return;
+    }
+    load_image_by_index(app, state, target as usize, load_seq, queue, cache, tip_timer);
+}
+
 /// 应用一次加载结果（主线程 Timer 轮询队列时调用）
-fn apply_load_result(app: &AppWindow, state: &Rc<RefCell<AppState>>, r: LoadResult) {
+fn apply_load_result(
+    app: &AppWindow,
+    state: &Rc<RefCell<AppState>>,
+    r: LoadResult,
+    tip_timer: &Rc<RefCell<Timer>>,
+) {
     let mut st = state.borrow_mut();
     let (w, h, rgba) = match r.decoded {
         Ok(v) => v,
@@ -618,6 +723,14 @@ fn apply_load_result(app: &AppWindow, state: &Rc<RefCell<AppState>>, r: LoadResu
         "已加载: {name} ({w}x{h}) · 标注 {}",
         st.store.len()
     )));
+    // 极简模式无状态栏：切图后点亮提示条显示文件名与序号（3 秒熄灭）
+    if app.get_minimal_mode() {
+        flash_tip(
+            app,
+            tip_timer,
+            &format!("{name} · {}/{}", r.current_index + 1, st.files.len().max(1)),
+        );
+    }
 }
 
 /// 重渲染标注层（仅已完成的图元）并推到 Slint
@@ -698,6 +811,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let load_queue: Arc<Mutex<Vec<LoadResult>>> = Arc::new(Mutex::new(Vec::new()));
     let decode_cache: Arc<Mutex<HashMap<usize, Arc<Decoded>>>> =
         Arc::new(Mutex::new(HashMap::new()));
+    // 极简模式提示条 3 秒熄灭计时器（进入极简 / 极简下切图共用）
+    let tip_timer = Rc::new(RefCell::new(Timer::default()));
+    // 极简模式窗口尺寸记录（进入时保存，退出恢复）
+    let window_restore = Rc::new(RefCell::new(None::<(u32, u32)>));
 
     // 3. 命令行参数：目录 → 工作目录模式；文件 → 单图模式
     if let Some(arg) = std::env::args().nth(1) {
@@ -712,7 +829,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             // 自动加载第一张（异步）
             let count = state.borrow().files.len();
             if count > 0 {
-                load_image_by_index(&app, &state, 0, &load_seq, &load_queue, &decode_cache);
+                load_image_by_index(&app, &state, 0, &load_seq, &load_queue, &decode_cache, &tip_timer);
             }
         } else {
             // 单图模式
@@ -934,9 +1051,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         });
     }
     {
-        // Ctrl+M：切换极简模式；进入时点亮提示条，3 秒后自动熄灭
+        // Ctrl+M：切换极简模式；进入时贴合图片调整窗口（退出恢复原尺寸）+ 点亮提示条
         let weak = app.as_weak();
-        let tip_timer = Rc::new(RefCell::new(Timer::default()));
+        let tip_timer = tip_timer.clone();
+        let window_restore = window_restore.clone();
         app.on_toggle_minimal(move || {
             let Some(app) = weak.upgrade() else {
                 return;
@@ -944,19 +1062,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let minimal = !app.get_minimal_mode();
             app.set_minimal_mode(minimal);
             if minimal {
-                app.set_minimal_tip_visible(true);
-                // 重置/启动 3 秒熄灭定时器
-                let weak = weak.clone();
-                let timer = tip_timer.clone();
-                timer.borrow().stop();
-                timer.borrow().start(TimerMode::SingleShot, Duration::from_millis(3000), move || {
-                    if let Some(app) = weak.upgrade() {
-                        app.set_minimal_tip_visible(false);
-                    }
-                });
+                // 记录当前窗口尺寸，并贴合当前图片（无图则仅隐藏 UI）
+                let cur = app.window().size();
+                *window_restore.borrow_mut() = Some((cur.width, cur.height));
+                minimal_fit_window(&app);
+                // 进入极简 = 回到「适应窗口」：图片完整居中，清除此前缩放/平移的残留位置
+                enter_fit(&app, "极简 · 适应窗口");
+                flash_tip(&app, &tip_timer, "极简模式 · Ctrl+M 退出 · Esc 取消/退出 · ←/→ 切图");
                 app.set_status(SharedString::from("极简模式（提示 3 秒后消失）"));
             } else {
+                tip_timer.borrow().stop();
                 app.set_minimal_tip_visible(false);
+                minimal_restore_window(&app, window_restore.borrow_mut().take());
                 app.set_status(SharedString::from("已退出极简模式"));
             }
         });
@@ -990,6 +1107,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let load_seq = load_seq.clone();
         let load_queue = load_queue.clone();
         let decode_cache = decode_cache.clone();
+        let tip_timer = tip_timer.clone();
         app.on_select_file(move || {
             let Some(app) = weak.upgrade() else {
                 return;
@@ -1032,7 +1150,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let count = st.files.len();
                 drop(st);
                 if count > 0 {
-                    load_image_by_index(&app, &state, 0, &load_seq, &load_queue, &decode_cache);
+                    load_image_by_index(&app, &state, 0, &load_seq, &load_queue, &decode_cache, &tip_timer);
                 }
             } else {
                 // 图片行（行号 - 目录数 = 图片索引）
@@ -1041,7 +1159,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     return;
                 }
                 drop(st);
-                load_image_by_index(&app, &state, img_idx, &load_seq, &load_queue, &decode_cache);
+                load_image_by_index(&app, &state, img_idx, &load_seq, &load_queue, &decode_cache, &tip_timer);
             }
         });
     }
@@ -1052,6 +1170,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let load_seq = load_seq.clone();
         let load_queue = load_queue.clone();
         let decode_cache = decode_cache.clone();
+        let tip_timer = tip_timer.clone();
         app.on_crumb_clicked(move || {
             let Some(app) = weak.upgrade() else {
                 return;
@@ -1075,7 +1194,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let count = st.files.len();
             drop(st);
             if count > 0 {
-                load_image_by_index(&app, &state, 0, &load_seq, &load_queue, &decode_cache);
+                load_image_by_index(&app, &state, 0, &load_seq, &load_queue, &decode_cache, &tip_timer);
             }
         });
     }
@@ -1111,6 +1230,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let load_seq = load_seq.clone();
         let load_queue = load_queue.clone();
         let decode_cache = decode_cache.clone();
+        let tip_timer = tip_timer.clone();
         app.on_recent_selected(move || {
             let Some(app) = weak.upgrade() else {
                 return;
@@ -1133,8 +1253,38 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let count = st.files.len();
             drop(st);
             if count > 0 {
-                load_image_by_index(&app, &state, 0, &load_seq, &load_queue, &decode_cache);
+                load_image_by_index(&app, &state, 0, &load_seq, &load_queue, &decode_cache, &tip_timer);
             }
+        });
+    }
+    {
+        // ← 上一张
+        let weak = app.as_weak();
+        let state = state.clone();
+        let load_seq = load_seq.clone();
+        let load_queue = load_queue.clone();
+        let decode_cache = decode_cache.clone();
+        let tip_timer = tip_timer.clone();
+        app.on_prev_image(move || {
+            let Some(app) = weak.upgrade() else {
+                return;
+            };
+            step_image(&app, &state, -1, &load_seq, &load_queue, &decode_cache, &tip_timer);
+        });
+    }
+    {
+        // → 下一张
+        let weak = app.as_weak();
+        let state = state.clone();
+        let load_seq = load_seq.clone();
+        let load_queue = load_queue.clone();
+        let decode_cache = decode_cache.clone();
+        let tip_timer = tip_timer.clone();
+        app.on_next_image(move || {
+            let Some(app) = weak.upgrade() else {
+                return;
+            };
+            step_image(&app, &state, 1, &load_seq, &load_queue, &decode_cache, &tip_timer);
         });
     }
 
@@ -1329,6 +1479,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let state = state.clone();
         let load_seq = load_seq.clone();
         let load_queue = load_queue.clone();
+        let tip_timer = tip_timer.clone();
         load_timer.start(TimerMode::Repeated, Duration::from_millis(80), move || {
             // 取出队列中最新一条未过期结果应用
             let result: Option<LoadResult> = {
@@ -1348,7 +1499,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             };
             if let Some(r) = result {
                 if let Some(app) = weak.upgrade() {
-                    apply_load_result(&app, &state, r);
+                    apply_load_result(&app, &state, r, &tip_timer);
                 }
             }
         });
