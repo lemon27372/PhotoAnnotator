@@ -121,7 +121,8 @@ pub fn upsert_file(workspace_id: i64, path: &str, width: i32, height: i32) -> Op
     .ok()
 }
 
-/// 批量 upsert（单连接 + 事务；顺序返回 file id，失败项为 -1）。目录扫描时避免 N 次开连接
+/// 批量 upsert（单连接 + **事务**，一次提交；顺序返回 file id，失败项为 -1）。
+/// 目录扫描避免 N 次开连接 + N 次 autocommit fsync（打开大目录卡顿根因）
 pub fn upsert_files_batch(workspace_id: i64, paths: &[String]) -> Vec<i64> {
     let conn = match open() {
         Ok(c) => c,
@@ -132,6 +133,10 @@ pub fn upsert_files_batch(workspace_id: i64, paths: &[String]) -> Vec<i64> {
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0);
     let mut out = Vec::with_capacity(paths.len());
+    // 显式事务：BEGIN → N 条 INSERT → COMMIT（单次 fsync）
+    if conn.execute_batch("BEGIN").is_err() {
+        return paths.iter().map(|_| -1).collect();
+    }
     for p in paths {
         let modified = std::fs::metadata(p)
             .and_then(|m| m.modified())
@@ -158,6 +163,7 @@ pub fn upsert_files_batch(workspace_id: i64, paths: &[String]) -> Vec<i64> {
             .unwrap_or(-1);
         out.push(id);
     }
+    let _ = conn.execute_batch("COMMIT");
     out
 }
 
