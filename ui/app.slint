@@ -272,6 +272,8 @@ export component AppWindow inherits Window {
     callback recent-selected;
     // 「最近」按钮：Rust 端拉取列表并切换面板显隐
     callback open-recent;
+    // 「打开」按钮：系统对话框选择工作目录（Windows 原生 SHBrowseForFolder）
+    callback open-folder;
     // 侧边栏信息（图/目录计数）
     in-out property <string> sidebar-meta: "";
     // 切图加载中（画布中央浮层）
@@ -429,6 +431,11 @@ export component AppWindow inherits Window {
                             font-size: 10px;
                             color: #757575;
                             vertical-alignment: center;
+                        }
+                        SideBtn {
+                            label: "打开";
+                            active: false;
+                            clicked => { root.open-folder(); }
                         }
                         SideBtn {
                             label: "最近";

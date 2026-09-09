@@ -263,6 +263,91 @@ fn replace_file(path: &str, bytes: &[u8]) -> std::io::Result<()> {
     Ok(())
 }
 
+// ---------- 系统目录选择（Windows 原生 SHBrowseForFolderW；零依赖、离线可编译） ----------
+
+#[cfg(target_os = "windows")]
+#[repr(C)]
+struct BrowseInfoW {
+    hwnd_owner: *mut std::ffi::c_void,
+    pidl_root: *mut std::ffi::c_void,
+    psz_display_name: *mut u16,
+    lpsz_title: *const u16,
+    ul_flags: u32,
+    lpfn: Option<
+        unsafe extern "system" fn(
+            *mut BrowseInfoW,
+            *mut std::ffi::c_void,
+            *mut std::ffi::c_void,
+            *mut std::ffi::c_void,
+        ) -> isize,
+    >,
+    l_param: isize,
+    i_image: i32,
+}
+
+/// 弹出系统文件夹选择框，返回所选目录（取消返回 None）；非 Windows 平台不可用
+#[cfg(target_os = "windows")]
+fn pick_folder_win() -> Option<String> {
+    use std::ffi::c_void;
+    #[link(name = "ole32")]
+    unsafe extern "system" {
+        fn CoInitializeEx(pv_reserved: *mut c_void, dw_co_init: u32) -> i32;
+        fn CoUninitialize();
+        fn CoTaskMemFree(pv: *mut c_void);
+    }
+    #[link(name = "shell32")]
+    unsafe extern "system" {
+        fn SHBrowseForFolderW(lpbi: *mut BrowseInfoW) -> *mut c_void;
+        fn SHGetPathFromIDListW(pidl: *const c_void, psz_path: *mut u16) -> i32;
+    }
+    const COINIT_APARTMENTTHREADED: u32 = 0x2;
+    const BIF_RETURNONLYFSDIRS: u32 = 0x0001;
+    const BIF_NEWDIALOGSTYLE: u32 = 0x0040;
+
+    let title: Vec<u16> = "选择工作目录（图片文件夹）\0".encode_utf16().collect();
+    unsafe {
+        // 模态对话框前初始化 COM（STA）；已初始化则返回 S_FALSE，同样需要一次 Uninitialize
+        let co = CoInitializeEx(std::ptr::null_mut(), COINIT_APARTMENTTHREADED);
+        let mut display = [0u16; 1024];
+        let mut bi = BrowseInfoW {
+            hwnd_owner: std::ptr::null_mut(),
+            pidl_root: std::ptr::null_mut(),
+            psz_display_name: display.as_mut_ptr(),
+            lpsz_title: title.as_ptr(),
+            ul_flags: BIF_RETURNONLYFSDIRS | BIF_NEWDIALOGSTYLE,
+            lpfn: None,
+            l_param: 0,
+            i_image: 0,
+        };
+        let result = {
+            let pidl = SHBrowseForFolderW(&mut bi);
+            if pidl.is_null() {
+                None
+            } else {
+                let mut buf = [0u16; 32768];
+                let ok = SHGetPathFromIDListW(pidl, buf.as_mut_ptr());
+                CoTaskMemFree(pidl);
+                if ok != 0 {
+                    let len = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
+                    Some(String::from_utf16_lossy(&buf[..len]))
+                } else {
+                    None
+                }
+            }
+        };
+        if co == 0 || co == 1 {
+            // S_OK / S_FALSE
+            CoUninitialize();
+        }
+        result.filter(|p| !p.is_empty())
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn pick_folder_win() -> Option<String> {
+    None
+}
+
 /// 校验并合成重命名目标绝对路径：非法字符/空名/保留名拒绝；扩展名须与原一致（未输入自动补）
 fn validate_rename(new_name: &str, old_path: &str) -> Result<String, String> {
     let old = std::path::Path::new(old_path);
@@ -323,37 +408,110 @@ fn png_to_image(png: &[u8]) -> Option<Image> {
     Some(Image::from_rgba8(buf))
 }
 
-/// 若当前图片已入库，把标注持久化到 DB（切图前调用）
-fn persist_current(st: &mut AppState) {
-    if st.file_id >= 0 {
-        storage::db::save_annotations(st.file_id, &st.store.to_json());
-    }
+/// 后台缩略图生成完成通知
+struct ThumbResult {
+    /// 发起轮次（目录切换后旧轮次结果丢弃）
+    round: u32,
+    /// 图片在 files 中的索引
+    idx: usize,
+    /// 生成的 PNG 字节（失败为 None）
+    png: Option<Vec<u8>>,
 }
 
-/// 获取/生成某文件缩略图（DB 缓存 → 生成并缓存），并写入内存缓存
-fn ensure_thumbnail(st: &mut AppState, idx: usize) -> Option<Image> {
+struct ThumbCtx {
+    round: std::sync::atomic::AtomicU32,
+    results: Mutex<Vec<ThumbResult>>,
+}
+
+static THUMB_CTX: std::sync::OnceLock<ThumbCtx> = std::sync::OnceLock::new();
+
+fn thumb_ctx() -> &'static ThumbCtx {
+    THUMB_CTX.get_or_init(|| ThumbCtx {
+        round: AtomicU32::new(0),
+        results: Mutex::new(Vec::new()),
+    })
+}
+
+/// 只读缩略图（内存缓存 → DB 缓存）；未命中返回 None，生成交给后台线程
+fn ensure_thumbnail_cached(st: &mut AppState, idx: usize) -> Option<Image> {
     if let Some(img) = st.thumb_cache.get(idx).and_then(|c| c.clone()) {
         return Some(img);
     }
     if st.thumb_cache.len() <= idx {
         st.thumb_cache.resize(idx + 1, None);
     }
-    let img = (|| {
-        let file_id = *st.file_ids.get(idx)?;
-        // DB 缓存命中
-        if let Some(png) = storage::db::load_thumbnail(file_id) {
-            if let Some(img) = png_to_image(&png) {
-                return Some(img);
-            }
-        }
-        // 生成并缓存
-        let path = std::path::Path::new(st.files.get(idx)?);
-        let png = workspace::gen_thumbnail_png(path, 96)?;
-        storage::db::save_thumbnail(file_id, &png);
-        png_to_image(&png)
-    })();
+    let file_id = *st.file_ids.get(idx)?;
+    let png = storage::db::load_thumbnail(file_id)?;
+    let img = png_to_image(&png);
     st.thumb_cache[idx] = img.clone();
     img
+}
+
+/// 后台线程批量生成缩略图（串行逐张，避免同时解码 N 张大图爆内存）；结果入 ctx 队列
+fn spawn_thumb_jobs(jobs: Vec<(usize, String, i64)>, round: u32) {
+    if jobs.is_empty() {
+        return;
+    }
+    let ctx = thumb_ctx();
+    std::thread::spawn(move || {
+        for (idx, path, _file_id) in jobs {
+            let png = workspace::gen_thumbnail_png(std::path::Path::new(&path), 96);
+            if let Ok(mut q) = ctx.results.lock() {
+                q.push(ThumbResult { round, idx, png });
+            }
+        }
+    });
+}
+
+/// 应用一张后台缩略图：写内存缓存并增量更新列表/网格 model 对应行（仅最新轮次）
+fn apply_thumb_result(app: &AppWindow, state: &Rc<RefCell<AppState>>, r: ThumbResult) {
+    if r.round != thumb_ctx().round.load(Ordering::Relaxed) {
+        return; // 过期轮次（目录已切换）
+    }
+    let img = match r.png.as_deref().and_then(png_to_image) {
+        Some(i) => i,
+        None => return,
+    };
+    let mut st = state.borrow_mut();
+    if r.idx >= st.files.len() {
+        return;
+    }
+    if st.thumb_cache.len() <= r.idx {
+        st.thumb_cache.resize(r.idx + 1, None);
+    }
+    st.thumb_cache[r.idx] = Some(img.clone());
+    // 持久化 DB 缓存（file id 不变，内容与内存一致）
+    if let Some(&fid) = st.file_ids.get(r.idx).filter(|f| **f >= 0) {
+        if let Some(png) = &r.png {
+            storage::db::save_thumbnail(fid, png);
+        }
+    }
+    // 更新 file-list model：图片行位置 = 目录数 + 图片索引
+    let list_row = st.dirs.len() + r.idx;
+    let file_list = app.get_file_list();
+    if let Some(mut e) = file_list.row_data(list_row) {
+        e.thumb = img.clone();
+        file_list.set_row_data(list_row, e);
+    }
+    // 更新 grid model：全局条目号 = dirs.len() + idx，所在行/格
+    let gidx = st.dirs.len() + r.idx;
+    let (grid_row, grid_col) = (gidx / 3, gidx % 3);
+    let grid_rows = app.get_grid_rows();
+    if let Some(mut row) = grid_rows.row_data(grid_row) {
+        match grid_col {
+            0 => row.c0.thumb = img.clone(),
+            1 => row.c1.thumb = img.clone(),
+            _ => row.c2.thumb = img,
+        }
+        grid_rows.set_row_data(grid_row, row);
+    }
+}
+
+/// 若当前图片已入库，把标注持久化到 DB（切图前调用）
+fn persist_current(st: &mut AppState) {
+    if st.file_id >= 0 {
+        storage::db::save_annotations(st.file_id, &st.store.to_json());
+    }
 }
 
 /// 当前浏览目录（面包屑栈顶；无工作区时 None）
@@ -390,27 +548,23 @@ fn placeholder_entry() -> FileEntry {
 }
 
 /// 重建侧边栏：file-list（子目录行 + 图片行）+ grid-rows（每行 3 格）+ 面包屑 + 计数 + 当前行高亮
+/// 缩略图只读缓存先行；未命中收集到后台线程生成（渐进回填，主线程不阻塞解码）
 fn rebuild_sidebar(app: &AppWindow, st: &mut AppState) {
-    // 1. 图片行元信息（借用分离，避免冲突）
-    let imgs: Vec<(String, String, i32)> = st
-        .files
-        .iter()
-        .map(|path| {
-            let name = dir_display_name(path);
-            let status = if st.workspace_id >= 0 {
-                match storage::db::file_status(st.workspace_id, path).as_str() {
-                    "done" => 1,
-                    "ignored" => 2,
-                    _ => 0,
-                }
-            } else {
-                0
-            };
-            (path.clone(), name, status)
-        })
-        .collect();
+    // 1. 状态批量查询（单连接，避免 N 次开库）
+    let statuses: Vec<i32> = if st.workspace_id >= 0 {
+        storage::db::file_statuses_batch(st.workspace_id, &st.files)
+            .iter()
+            .map(|s| match s.as_str() {
+                "done" => 1,
+                "ignored" => 2,
+                _ => 0,
+            })
+            .collect()
+    } else {
+        st.files.iter().map(|_| 0).collect()
+    };
 
-    let mut entries: Vec<FileEntry> = Vec::with_capacity(st.dirs.len() + imgs.len());
+    let mut entries: Vec<FileEntry> = Vec::with_capacity(st.dirs.len() + st.files.len());
     // 子目录行（kind=1，无缩略图；列在图片之前 → 行号前缀即 dirs.len()）
     for d in &st.dirs {
         entries.push(FileEntry {
@@ -421,15 +575,22 @@ fn rebuild_sidebar(app: &AppWindow, st: &mut AppState) {
             thumb: Image::default(),
         });
     }
-    // 图片行（kind=0）
-    for (i, (path, name, status)) in imgs.into_iter().enumerate() {
-        let thumb = ensure_thumbnail(st, i).unwrap_or_default();
+    // 图片行（kind=0；缩略图读缓存，未命中待后台回填）
+    let mut thumb_jobs: Vec<(usize, String, i64)> = Vec::new();
+    for i in 0..st.files.len() {
+        let path = st.files[i].clone();
+        let cached = ensure_thumbnail_cached(st, i);
+        if cached.is_none() && st.workspace_id >= 0 {
+            if let Some(&fid) = st.file_ids.get(i).filter(|f| **f >= 0) {
+                thumb_jobs.push((i, path.clone(), fid));
+            }
+        }
         entries.push(FileEntry {
             path: path.into(),
-            name: name.into(),
+            name: dir_display_name(&st.files[i]).into(),
             kind: 0,
-            status,
-            thumb,
+            status: statuses[i],
+            thumb: cached.unwrap_or_default(),
         });
     }
     app.set_file_list(slint::ModelRc::from(Rc::new(slint::VecModel::from(entries.clone()))));
@@ -470,6 +631,13 @@ fn rebuild_sidebar(app: &AppWindow, st: &mut AppState) {
 
     // 5. 当前选中行高亮（目录切换后重算）
     app.set_current_row(current_row(st));
+
+    // 6. 缩略图后台生成（新轮次；旧轮次结果将被丢弃）
+    if !thumb_jobs.is_empty() {
+        let ctx = thumb_ctx();
+        let round = ctx.round.fetch_add(1, Ordering::Relaxed) + 1;
+        spawn_thumb_jobs(thumb_jobs, round);
+    }
 }
 
 /// 按当前浏览目录（nav_stack 栈顶）重新扫描：dirs + files + file_ids + 缓存重置
@@ -491,12 +659,9 @@ fn rescan_current(app: &AppWindow, st: &mut AppState) {
     st.current_index = -1;
     st.file_id = -1;
     st.file_ids.clear();
-    // 入库获取 file id（宽高暂 0，打开时更新）
-    if st.workspace_id >= 0 {
-        for p in &st.files {
-            st.file_ids
-                .push(storage::db::upsert_file(st.workspace_id, p, 0, 0).unwrap_or(-1));
-        }
+    // 入库获取 file id（批量单连接；宽高暂 0，打开时更新）
+    if st.workspace_id >= 0 && !st.files.is_empty() {
+        st.file_ids = storage::db::upsert_files_batch(st.workspace_id, &st.files);
     }
     app.set_current_index(-1);
     rebuild_sidebar(app, st);
@@ -1372,6 +1537,40 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         });
     }
     {
+        // 「打开」：系统文件夹选择框 → 打开为工作区（与命令行/最近等价）
+        let weak = app.as_weak();
+        let state = state.clone();
+        let load_seq = load_seq.clone();
+        let load_queue = load_queue.clone();
+        let decode_cache = decode_cache.clone();
+        let tip_timer = tip_timer.clone();
+        app.on_open_folder(move || {
+            let Some(app) = weak.upgrade() else {
+                return;
+            };
+            // 模态目录选择（阻塞直到用户选择/取消）
+            let Some(dir) = pick_folder_win() else {
+                app.set_status(SharedString::from("已取消选择"));
+                return;
+            };
+            if !std::path::Path::new(&dir).is_dir() {
+                app.set_status(SharedString::from("所选不是有效目录"));
+                return;
+            }
+            if let Ok(mut c) = decode_cache.lock() {
+                c.clear();
+            }
+            println!("[workspace] 通过对话框打开工作目录: {dir}");
+            let mut st = state.borrow_mut();
+            open_workspace(&app, &mut st, &dir);
+            let count = st.files.len();
+            drop(st);
+            if count > 0 {
+                load_image_by_index(&app, &state, 0, &load_seq, &load_queue, &decode_cache, &tip_timer);
+            }
+        });
+    }
+    {
         // 最近工作区条目点击：切换到该工作区（等同命令行打开目录）
         let weak = app.as_weak();
         let state = state.clone();
@@ -1702,7 +1901,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         });
     }
 
-    // 7. 异步轮询（主线程）：切图解码结果应用（过期序号丢弃）+ 覆盖保存结果收尾
+    // 7. 异步轮询（主线程）：切图解码结果应用 + 覆盖保存收尾 + 后台缩略图回填
     let load_timer = Timer::default();
     {
         let weak = app.as_weak();
@@ -1744,6 +1943,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             if let Some(out) = save_out {
                 if let Some(app) = weak.upgrade() {
                     finish_save(&app, &state, out);
+                }
+            }
+            // 后台缩略图逐张回填（每轮取一条，渐进刷新不阻塞）
+            let thumb_out: Option<ThumbResult> = {
+                let mut q = match thumb_ctx().results.lock() {
+                    Ok(q) => q,
+                    Err(_) => return,
+                };
+                q.pop()
+            };
+            if let Some(t) = thumb_out {
+                if let Some(app) = weak.upgrade() {
+                    apply_thumb_result(&app, &state, t);
                 }
             }
         });

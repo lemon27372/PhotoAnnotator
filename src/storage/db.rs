@@ -121,18 +121,63 @@ pub fn upsert_file(workspace_id: i64, path: &str, width: i32, height: i32) -> Op
     .ok()
 }
 
-/// 读取文件状态（pending/done/ignored），未知文件返回 pending
-pub fn file_status(workspace_id: i64, path: &str) -> String {
+/// 批量 upsert（单连接 + 事务；顺序返回 file id，失败项为 -1）。目录扫描时避免 N 次开连接
+pub fn upsert_files_batch(workspace_id: i64, paths: &[String]) -> Vec<i64> {
     let conn = match open() {
         Ok(c) => c,
-        Err(_) => return "pending".into(),
+        Err(_) => return paths.iter().map(|_| -1).collect(),
     };
-    conn.query_row(
-        "SELECT status FROM files WHERE workspace_id = ?1 AND path = ?2",
-        rusqlite::params![workspace_id, path],
-        |r| r.get::<_, String>(0),
-    )
-    .unwrap_or_else(|_| "pending".into())
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    let mut out = Vec::with_capacity(paths.len());
+    for p in paths {
+        let modified = std::fs::metadata(p)
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(now);
+        let id = conn
+            .execute(
+                "INSERT INTO files (workspace_id, path, width, height, modified_at, status)
+                 VALUES (?1, ?2, 0, 0, ?3, 'pending')
+                 ON CONFLICT(workspace_id, path) DO UPDATE SET modified_at = ?3",
+                rusqlite::params![workspace_id, p, modified],
+            )
+            .ok()
+            .and_then(|_| {
+                conn.query_row(
+                    "SELECT id FROM files WHERE workspace_id = ?1 AND path = ?2",
+                    rusqlite::params![workspace_id, p],
+                    |r| r.get(0),
+                )
+                .ok()
+            })
+            .unwrap_or(-1);
+        out.push(id);
+    }
+    out
+}
+
+/// 批量读取状态（pending/done/ignored），顺序对应输入路径；未知文件为 "pending"
+pub fn file_statuses_batch(workspace_id: i64, paths: &[String]) -> Vec<String> {
+    let conn = match open() {
+        Ok(c) => c,
+        Err(_) => return paths.iter().map(|_| "pending".into()).collect(),
+    };
+    paths
+        .iter()
+        .map(|p| {
+            conn.query_row(
+                "SELECT status FROM files WHERE workspace_id = ?1 AND path = ?2",
+                rusqlite::params![workspace_id, p],
+                |r| r.get::<_, String>(0),
+            )
+            .unwrap_or_else(|_| "pending".into())
+        })
+        .collect()
 }
 
 /// 设置文件状态（标注完成 → done）
