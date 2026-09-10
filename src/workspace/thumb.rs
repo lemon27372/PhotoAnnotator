@@ -3,8 +3,9 @@
 use std::path::Path;
 
 /// 生成等比缩略图 PNG（最长边限 size；不放大）
+/// 按**文件内容**嗅探格式（扩展名不可靠时同样可用）
 pub fn gen_thumbnail_png(path: &Path, size: u32) -> Option<Vec<u8>> {
-    let img = image::open(path).ok()?;
+    let img = image::ImageReader::open(path).ok()?.with_guessed_format().ok()?.decode().ok()?;
     // 计算目标尺寸（保持比例）
     let (w, h) = (img.width(), img.height());
     let scale = size as f32 / w.max(h).max(1) as f32;

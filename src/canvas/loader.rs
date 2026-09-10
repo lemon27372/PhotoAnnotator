@@ -5,8 +5,12 @@ use slint::{Image, Rgba8Pixel, SharedPixelBuffer};
 
 /// 解码图片为 RGBA（不构造 Slint Image —— 供后台线程使用，返回 Send 数据）
 /// 返回 (宽, 高, straight-alpha RGBA)
+/// 注意：按**文件内容**嗅探格式（with_guessed_format），不依赖扩展名
+/// —— 扩展名与实际内容不符（如 jpg 改名 .png）时也能正常打开
 pub fn decode_image(path: &str) -> Result<(u32, u32, Vec<u8>), Box<dyn std::error::Error>> {
-    let decoded = image::open(path)?;
+    let decoded = image::ImageReader::open(path)?
+        .with_guessed_format()?
+        .decode()?;
     let rgba = decoded.to_rgba8(); // 统一转 RGBA8，屏蔽源格式差异
     let (w, h) = rgba.dimensions();
     Ok((w, h, rgba.into_raw()))

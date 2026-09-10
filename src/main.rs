@@ -205,6 +205,8 @@ struct AppState {
     rename_pending: Option<(String, usize)>,
     /// 覆盖保存进行中（防重复触发；后台合成/编码期间标志置位）
     save_pending: bool,
+    /// 排序模式：0=名称升序 1=名称降序 2=时间升序 3=时间降序
+    sort_mode: u8,
 }
 
 impl AppState {
@@ -229,8 +231,80 @@ impl AppState {
             last_click_at: 0,
             rename_pending: None,
             save_pending: false,
+            sort_mode: 0,
         }
     }
+}
+
+/// 排序模式显示名（侧边栏按钮 label）
+fn sort_label(mode: u8) -> &'static str {
+    match mode {
+        0 => "名↑",
+        1 => "名↓",
+        2 => "时↑",
+        _ => "时↓",
+    }
+}
+
+/// 名称排序 key（不区分大小写，Windows 习惯）
+fn sort_name_key(path: &str) -> String {
+    std::path::Path::new(path)
+        .file_name()
+        .map(|s| s.to_string_lossy().to_lowercase())
+        .unwrap_or_default()
+}
+
+/// 修改时间排序 key（读取失败回退 0）
+fn sort_time_key(path: &str) -> u64 {
+    std::fs::metadata(path)
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// 按当前 sort_mode 重排当前目录条目（子目录与图片各自排序；同步重排 file_ids/缩略图缓存；
+/// 保持当前显示图片仍指向同一文件）
+fn apply_sort(st: &mut AppState) {
+    let mode = st.sort_mode;
+    let asc = mode % 2 == 0;
+    let by_time = mode >= 2;
+
+    // 子目录排序
+    if by_time {
+        st.dirs.sort_by_key(|p| sort_time_key(p));
+    } else {
+        st.dirs.sort_by_key(|p| sort_name_key(p));
+    }
+    if !asc {
+        st.dirs.reverse();
+    }
+
+    // 图片排序：索引置换，files/file_ids/thumb_cache 三数组同步重排
+    let mut idx: Vec<usize> = (0..st.files.len()).collect();
+    if by_time {
+        idx.sort_by_key(|&i| sort_time_key(&st.files[i]));
+    } else {
+        idx.sort_by_key(|&i| sort_name_key(&st.files[i]));
+    }
+    if !asc {
+        idx.reverse();
+    }
+    let current_path = st.image_path.clone();
+    let new_files: Vec<String> = idx.iter().map(|&i| st.files[i].clone()).collect();
+    let new_ids: Vec<i64> = idx.iter().map(|&i| *st.file_ids.get(i).unwrap_or(&-1)).collect();
+    let new_thumbs: Vec<Option<slint::Image>> =
+        idx.iter().map(|&i| st.thumb_cache.get(i).cloned().flatten()).collect();
+    st.files = new_files;
+    st.file_ids = new_ids;
+    st.thumb_cache = new_thumbs;
+    // 当前图重定位（保持选中；找不到则 -1）
+    st.current_index = current_path
+        .as_deref()
+        .and_then(|p| st.files.iter().position(|f| f == p))
+        .map(|i| i as i64)
+        .unwrap_or(-1);
 }
 
 // ---------- 覆盖保存（2026-09-09 起：Ctrl+S 直接写回原图，不再另存 _annotated.png） ----------
@@ -663,6 +737,8 @@ fn rescan_current(app: &AppWindow, st: &mut AppState) {
     if st.workspace_id >= 0 && !st.files.is_empty() {
         st.file_ids = storage::db::upsert_files_batch(st.workspace_id, &st.files);
     }
+    // 按当前排序模式排列（新目录沿用用户选择）
+    apply_sort(st);
     app.set_current_index(-1);
     rebuild_sidebar(app, st);
     if st.dirs.is_empty() && st.files.is_empty() {
@@ -676,6 +752,8 @@ fn open_workspace(app: &AppWindow, st: &mut AppState, dir: &str) {
     st.workspace_dir = Some(dir.to_string());
     st.workspace_id = storage::db::touch_workspace(dir).unwrap_or(-1);
     st.nav_stack = vec![dir.to_string()];
+    // 记住上次工作区（无参数启动时自动恢复）
+    storage::db::set_setting("last_workspace", dir);
     rescan_current(app, st);
     app.set_workspace_title(SharedString::from(dir_display_name(dir)));
 }
@@ -1096,9 +1174,16 @@ fn annotation_from_shape(tool: Tool, x1: f32, y1: f32, x2: f32, y2: f32) -> Anno
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // 1. 存储：初始化数据库（4 张表，幂等）
-    let db = storage::init()?;
-    println!("[storage] SQLite 初始化完成: {}", db.display());
+    // 1. 存储：初始化数据库（幂等建表）
+    //    数据库不可用（权限/只读/被占用）时降级运行：不持久化但不阻塞使用
+    let mut db_ok = true;
+    match storage::init() {
+        Ok(path) => println!("[storage] SQLite 初始化完成: {}", path.display()),
+        Err(e) => {
+            db_ok = false;
+            eprintln!("[storage] 数据库不可用，降级为无持久化模式: {e}");
+        }
+    }
 
     // 2. 窗口
     let app = AppWindow::new()?;
@@ -1115,7 +1200,27 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 极简模式窗口尺寸记录（进入时保存，退出恢复）
     let window_restore = Rc::new(RefCell::new(None::<(u32, u32)>));
 
-    // 3. 命令行参数：目录 → 工作目录模式；文件 → 单图模式
+    // 2.5 恢复上次偏好（排序模式 / 列表网格视图）——设置存 SQLite settings 表
+    {
+        if !db_ok {
+            app.set_status(SharedString::from(
+                "提示：数据存储不可用（权限/只读），本次标注与设置不会被记住",
+            ));
+        }
+        let saved_sort = storage::db::get_setting("sort_mode")
+            .and_then(|s| s.parse::<u8>().ok())
+            .unwrap_or(0)
+            .min(3);
+        let saved_view = storage::db::get_setting("view_mode")
+            .and_then(|s| s.parse::<i32>().ok())
+            .unwrap_or(0)
+            .clamp(0, 1);
+        state.borrow_mut().sort_mode = saved_sort;
+        app.set_sort_label(SharedString::from(sort_label(saved_sort)));
+        app.set_view_mode(saved_view);
+    }
+
+    // 3. 命令行参数：目录 → 工作目录模式；文件 → 单图模式；无参数 → 恢复上次工作区
     if let Some(arg) = std::env::args().nth(1) {
         let arg_path = std::path::Path::new(&arg);
         if arg_path.is_dir() {
@@ -1152,6 +1257,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     eprintln!("[canvas] 图片加载失败: {arg}: {e}");
                 }
             }
+        }
+    } else if let Some(last) = storage::db::get_setting("last_workspace") {
+        // 无参数启动：自动恢复上次工作区（目录仍存在时）
+        if std::path::Path::new(&last).is_dir() {
+            println!("[workspace] 恢复上次工作目录: {last}");
+            {
+                let mut st = state.borrow_mut();
+                open_workspace(&app, &mut st, &last);
+            }
+            let count = state.borrow().files.len();
+            if count > 0 {
+                load_image_by_index(&app, &state, 0, &load_seq, &load_queue, &decode_cache, &tip_timer);
+            }
+        } else {
+            app.set_status(SharedString::from("上次工作目录已不存在，请用「打开」选择"));
         }
     }
 
@@ -1568,6 +1688,39 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             if count > 0 {
                 load_image_by_index(&app, &state, 0, &load_seq, &load_queue, &decode_cache, &tip_timer);
             }
+        });
+    }
+    {
+        // 列表/网格视图切换：持久化偏好（重启保留）
+        let weak = app.as_weak();
+        app.on_view_changed(move || {
+            let Some(app) = weak.upgrade() else {
+                return;
+            };
+            storage::db::set_setting("view_mode", &app.get_view_mode().to_string());
+        });
+    }
+    {
+        // 排序切换（循环：名称↑ → 名称↓ → 时间↑ → 时间↓）：重排当前目录子目录与图片
+        let weak = app.as_weak();
+        let state = state.clone();
+        app.on_sort_toggle(move || {
+            let (Some(app), mut st) = (weak.upgrade(), state.borrow_mut()) else {
+                return;
+            };
+            st.sort_mode = (st.sort_mode + 1) % 4;
+            apply_sort(&mut st);
+            app.set_sort_label(SharedString::from(sort_label(st.sort_mode)));
+            // 持久化排序偏好（重启保留）
+            storage::db::set_setting("sort_mode", &st.sort_mode.to_string());
+            rebuild_sidebar(&app, &mut st);
+            let msg = match st.sort_mode {
+                0 => "排序：名称升序",
+                1 => "排序：名称降序",
+                2 => "排序：时间升序",
+                _ => "排序：时间降序",
+            };
+            app.set_status(SharedString::from(msg));
         });
     }
     {

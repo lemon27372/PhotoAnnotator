@@ -274,6 +274,11 @@ export component AppWindow inherits Window {
     callback open-recent;
     // 「打开」按钮：系统对话框选择工作目录（Windows 原生 SHBrowseForFolder）
     callback open-folder;
+    // 排序：点击循环 名称↑ → 名称↓ → 时间↑ → 时间↓（Rust 记模式并重排当前目录）
+    in-out property <string> sort-label: "名↑";
+    callback sort-toggle;
+    // 列表/网格视图切换（Rust 持久化偏好）
+    callback view-changed;
     // 侧边栏信息（图/目录计数）
     in-out property <string> sidebar-meta: "";
     // 切图加载中（画布中央浮层）
@@ -484,12 +489,23 @@ export component AppWindow inherits Window {
                             }
                         }
                         Rectangle { width: 4px; }
+                        // 排序模式（循环切换：名称/时间 × 升/降）
+                        SideBtn {
+                            label: root.sort-label;
+                            active: false;
+                            clicked => {
+                                root.sort-toggle();
+                                canvas-fs.focus();
+                            }
+                        }
                         SideBtn {
                             label: "列表";
                             active: root.view-mode == 0;
                             clicked => {
                                 root.view-mode = 0;
+                                root.view-changed();
                                 root.recent-visible = false;
+                                canvas-fs.focus();
                             }
                         }
                         SideBtn {
@@ -497,7 +513,9 @@ export component AppWindow inherits Window {
                             active: root.view-mode == 1;
                             clicked => {
                                 root.view-mode = 1;
+                                root.view-changed();
                                 root.recent-visible = false;
+                                canvas-fs.focus();
                             }
                         }
                     }

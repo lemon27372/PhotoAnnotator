@@ -51,10 +51,32 @@ pub fn init() -> rusqlite::Result<PathBuf> {
             data    BLOB NOT NULL,      -- 低分辨率位图缓存
             created_at INTEGER NOT NULL
         );
+
+        CREATE TABLE IF NOT EXISTS settings (
+            key   TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+        );
         ",
     )?;
 
     Ok(path)
+}
+
+/// 读取一项设置（无记录返回 None）
+pub fn get_setting(key: &str) -> Option<String> {
+    let conn = open().ok()?;
+    conn.query_row("SELECT value FROM settings WHERE key = ?1", [key], |r| r.get(0)).ok()
+}
+
+/// 写入/更新一项设置（持久化 UI 偏好：排序模式、上次工作区、列表/网格等）
+pub fn set_setting(key: &str, value: &str) {
+    if let Ok(conn) = open() {
+        let _ = conn.execute(
+            "INSERT INTO settings (key, value) VALUES (?1, ?2)
+             ON CONFLICT(key) DO UPDATE SET value = ?2",
+            rusqlite::params![key, value],
+        );
+    }
 }
 
 // ---------- 数据访问（每次操作独立打开连接，简化生命周期） ----------
