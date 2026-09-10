@@ -208,6 +208,21 @@ struct AppState {
     save_pending: bool,
     /// 排序模式：0=名称升序 1=名称降序 2=时间升序 3=时间降序
     sort_mode: u8,
+    /// 过滤：状态筛选 0=全部 1=未处理 2=已标注 3=已忽略
+    filter_status: u8,
+    /// 过滤：名称关键词（空 = 不过滤；不区分大小写包含匹配）
+    filter_name: String,
+    /// 当前侧边栏行映射（行号 → 目录/图片索引；排序与过滤后重建）
+    rows: Vec<RowRef>,
+    /// 右键操作菜单目标的图片索引（菜单确认时消费）
+    ctx_image: Option<usize>,
+}
+
+/// 侧边栏行的来源（目录或图片在各自数组中的索引）
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RowRef {
+    Dir(usize),
+    Img(usize),
 }
 
 impl AppState {
@@ -233,8 +248,56 @@ impl AppState {
             rename_pending: None,
             save_pending: false,
             sort_mode: 0,
+            filter_status: 0,
+            filter_name: String::new(),
+            rows: Vec::new(),
+            ctx_image: None,
         }
     }
+}
+
+/// 过滤状态显示名（过滤按钮 label）
+fn filter_label(mode: u8) -> &'static str {
+    match mode {
+        1 => "未",
+        2 => "标",
+        3 => "忽",
+        _ => "全",
+    }
+}
+
+/// 名称是否命中关键词（空关键词命中全部；不区分大小写）
+fn name_matches(path: &str, keyword: &str) -> bool {
+    if keyword.is_empty() {
+        return true;
+    }
+    let name = std::path::Path::new(path)
+        .file_name()
+        .map(|s| s.to_string_lossy().to_lowercase())
+        .unwrap_or_default();
+    name.contains(&keyword.to_lowercase())
+}
+
+/// 计算过滤后可见的条目索引：目录仅受名称过滤，图片受状态 + 名称过滤
+/// statuses 与 files 一一对应（0=未处理 1=已标注 2=已忽略）
+fn filter_indices(
+    dirs: &[String],
+    files: &[String],
+    statuses: &[i32],
+    filter_status: u8,
+    filter_name: &str,
+) -> (Vec<usize>, Vec<usize>) {
+    let vis_dirs: Vec<usize> = (0..dirs.len())
+        .filter(|&i| name_matches(&dirs[i], filter_name))
+        .collect();
+    let want_status = filter_status.saturating_sub(1) as i32;
+    let vis_imgs: Vec<usize> = (0..files.len())
+        .filter(|&i| {
+            let status_ok = filter_status == 0 || statuses.get(i).copied().unwrap_or(0) == want_status;
+            status_ok && name_matches(&files[i], filter_name)
+        })
+        .collect();
+    (vis_dirs, vis_imgs)
 }
 
 /// 排序模式显示名（侧边栏按钮 label）
@@ -461,14 +524,45 @@ fn validate_rename(new_name: &str, old_path: &str) -> Result<String, String> {
     Ok(target_path.to_string_lossy().into_owned())
 }
 
-/// 侧边栏行号 → 图片索引（目录行返回 None）
+/// 侧边栏行号 → 图片索引（目录行/越界返回 None）；按当前行映射表（受排序与过滤影响）
 fn row_to_image(st: &AppState, row: i64) -> Option<usize> {
-    let d = st.dirs.len() as i64;
-    if row < d {
+    if row < 0 {
         return None;
     }
-    let i = (row - d) as usize;
-    (i < st.files.len()).then_some(i)
+    match st.rows.get(row as usize) {
+        Some(RowRef::Img(i)) => Some(*i),
+        _ => None,
+    }
+}
+
+/// 打开重命名浮层（预填当前文件名；供右键菜单与直接入口共用）
+fn open_rename_dialog(app: &AppWindow, st: &mut AppState, img_idx: usize) {
+    let Some(old) = st.files.get(img_idx).cloned() else {
+        return;
+    };
+    let fname = std::path::Path::new(&old)
+        .file_name()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| old.clone());
+    st.rename_pending = Some((old, img_idx));
+    app.set_rename_title(SharedString::from(format!("重命名: {fname}")));
+    app.set_rename_draft(SharedString::from(fname));
+    app.set_rename_visible(true);
+}
+
+/// 右键菜单状态标记：写 DB 状态 + 刷新列表（过滤生效时该图可能从列表消失）
+fn mark_status(app: &AppWindow, st: &mut AppState, status: &str, msg: &str) {
+    let Some(img_idx) = st.ctx_image.take() else {
+        return;
+    };
+    let Some(path) = st.files.get(img_idx).cloned() else {
+        return;
+    };
+    if st.workspace_id >= 0 {
+        storage::db::set_file_status(st.workspace_id, &path, status);
+    }
+    rebuild_sidebar(app, st);
+    app.set_status(SharedString::from(format!("{msg}: {}", dir_display_name(&path))));
 }
 
 // ---------- 工作目录（第三阶段 P1+P2） ----------
@@ -561,15 +655,17 @@ fn apply_thumb_result(app: &AppWindow, state: &Rc<RefCell<AppState>>, r: ThumbRe
             storage::db::save_thumbnail(fid, png);
         }
     }
-    // 更新 file-list model：图片行位置 = 目录数 + 图片索引
-    let list_row = st.dirs.len() + r.idx;
+    // 更新 file-list model：按行映射定位该图片所在行（被过滤掉则跳过）
+    let Some(gidx) = st.rows.iter().position(|row| matches!(row, RowRef::Img(i) if *i == r.idx))
+    else {
+        return;
+    };
     let file_list = app.get_file_list();
-    if let Some(mut e) = file_list.row_data(list_row) {
+    if let Some(mut e) = file_list.row_data(gidx) {
         e.thumb = img.clone();
-        file_list.set_row_data(list_row, e);
+        file_list.set_row_data(gidx, e);
     }
-    // 更新 grid model：全局条目号 = dirs.len() + idx，所在行/格
-    let gidx = st.dirs.len() + r.idx;
+    // 更新 grid model：行/格由同一全局条目号推导
     let (grid_row, grid_col) = (gidx / 3, gidx % 3);
     let grid_rows = app.get_grid_rows();
     if let Some(mut row) = grid_rows.row_data(grid_row) {
@@ -602,13 +698,17 @@ fn dir_display_name(path: &str) -> String {
         .unwrap_or_else(|| path.to_string())
 }
 
-/// 当前图片在侧边栏列表中的行号（目录行在前 → 需偏移；-1 = 无选中图）
+/// 当前图片在侧边栏列表中的行号（按行映射查找；被过滤掉或未选中为 -1）
 fn current_row(st: &AppState) -> i32 {
-    if st.current_index >= 0 {
-        st.dirs.len() as i32 + st.current_index as i32
-    } else {
-        -1
+    if st.current_index < 0 {
+        return -1;
     }
+    let want = RowRef::Img(st.current_index as usize);
+    st.rows
+        .iter()
+        .position(|r| *r == want)
+        .map(|i| i as i32)
+        .unwrap_or(-1)
 }
 
 /// 空占位条目（网格行末尾补齐，kind=-1 不可交互）
@@ -623,7 +723,7 @@ fn placeholder_entry() -> FileEntry {
 }
 
 /// 重建侧边栏：file-list（子目录行 + 图片行）+ grid-rows（每行 3 格）+ 面包屑 + 计数 + 当前行高亮
-/// 缩略图只读缓存先行；未命中收集到后台线程生成（渐进回填，主线程不阻塞解码）
+/// 应用当前过滤（状态 + 名称）；缩略图只读缓存先行，未命中交后台线程生成（渐进回填）
 fn rebuild_sidebar(app: &AppWindow, st: &mut AppState) {
     // 1. 状态批量查询（单连接，避免 N 次开库）
     let statuses: Vec<i32> = if st.workspace_id >= 0 {
@@ -639,20 +739,31 @@ fn rebuild_sidebar(app: &AppWindow, st: &mut AppState) {
         st.files.iter().map(|_| 0).collect()
     };
 
-    let mut entries: Vec<FileEntry> = Vec::with_capacity(st.dirs.len() + st.files.len());
-    // 子目录行（kind=1，无缩略图；列在图片之前 → 行号前缀即 dirs.len()）
-    for d in &st.dirs {
+    // 2. 过滤（目录仅按名称；图片按状态 + 名称）
+    let (vis_dirs, vis_imgs) = filter_indices(
+        &st.dirs,
+        &st.files,
+        &statuses,
+        st.filter_status,
+        &st.filter_name,
+    );
+
+    // 3. 组装行（目录行在前）+ 行映射表
+    let mut row_map: Vec<RowRef> = Vec::with_capacity(vis_dirs.len() + vis_imgs.len());
+    let mut entries: Vec<FileEntry> = Vec::with_capacity(vis_dirs.len() + vis_imgs.len());
+    for &d in &vis_dirs {
+        row_map.push(RowRef::Dir(d));
         entries.push(FileEntry {
-            path: d.clone().into(),
-            name: dir_display_name(d).into(),
+            path: st.dirs[d].clone().into(),
+            name: dir_display_name(&st.dirs[d]).into(),
             kind: 1,
             status: 0,
             thumb: Image::default(),
         });
     }
-    // 图片行（kind=0；缩略图读缓存，未命中待后台回填）
     let mut thumb_jobs: Vec<(usize, String, i64)> = Vec::new();
-    for i in 0..st.files.len() {
+    for &i in &vis_imgs {
+        row_map.push(RowRef::Img(i));
         let path = st.files[i].clone();
         let cached = ensure_thumbnail_cached(st, i);
         if cached.is_none() && st.workspace_id >= 0 {
@@ -668,9 +779,10 @@ fn rebuild_sidebar(app: &AppWindow, st: &mut AppState) {
             thumb: cached.unwrap_or_default(),
         });
     }
+    st.rows = row_map;
     app.set_file_list(slint::ModelRc::from(Rc::new(slint::VecModel::from(entries.clone()))));
 
-    // 2. 网格行（固定 3 格，不足补占位）
+    // 4. 网格行（固定 3 格，不足补占位）
     let rows: Vec<GridRow> = entries
         .chunks(3)
         .map(|c| GridRow {
@@ -681,7 +793,7 @@ fn rebuild_sidebar(app: &AppWindow, st: &mut AppState) {
         .collect();
     app.set_grid_rows(slint::ModelRc::from(Rc::new(slint::VecModel::from(rows))));
 
-    // 3. 面包屑（各级显示名；仅多级时可见）
+    // 5. 面包屑（各级显示名；仅多级时可见）
     let crumbs: Vec<SharedString> = st
         .nav_stack
         .iter()
@@ -689,9 +801,12 @@ fn rebuild_sidebar(app: &AppWindow, st: &mut AppState) {
         .collect();
     app.set_crumb_list(slint::ModelRc::from(Rc::new(slint::VecModel::from(crumbs))));
 
-    // 4. 计数信息
+    // 6. 计数信息（有过滤时显示 可见/总数）
+    let filtering = st.filter_status != 0 || !st.filter_name.is_empty();
     let meta = if st.dirs.is_empty() && st.files.is_empty() {
         "空".to_string()
+    } else if filtering {
+        format!("{}/{} 图", vis_imgs.len(), st.files.len())
     } else {
         let mut parts = Vec::new();
         if !st.dirs.is_empty() {
@@ -704,10 +819,10 @@ fn rebuild_sidebar(app: &AppWindow, st: &mut AppState) {
     };
     app.set_sidebar_meta(SharedString::from(meta));
 
-    // 5. 当前选中行高亮（目录切换后重算）
+    // 7. 当前选中行高亮（按行映射查找；被过滤掉则为 -1）
     app.set_current_row(current_row(st));
 
-    // 6. 缩略图后台生成（新轮次；旧轮次结果将被丢弃）
+    // 8. 缩略图后台生成（新轮次；旧轮次结果将被丢弃）
     if !thumb_jobs.is_empty() {
         let ctx = thumb_ctx();
         let round = ctx.round.fetch_add(1, Ordering::Relaxed) + 1;
@@ -1218,8 +1333,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .and_then(|s| s.parse::<i32>().ok())
             .unwrap_or(0)
             .clamp(0, 1);
+        let saved_filter = storage::db::get_setting("filter_status")
+            .and_then(|s| s.parse::<u8>().ok())
+            .unwrap_or(0)
+            .min(3);
         state.borrow_mut().sort_mode = saved_sort;
+        state.borrow_mut().filter_status = saved_filter;
         app.set_sort_label(SharedString::from(sort_label(saved_sort)));
+        app.set_filter_label(SharedString::from(filter_label(saved_filter)));
         app.set_view_mode(saved_view);
     }
 
@@ -1460,29 +1581,36 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 // 0. 重命名浮层打开 → 关闭（丢弃草稿）
                 app.set_rename_visible(false);
                 st.rename_pending = None;
+            } else if app.get_ctx_visible() {
+                // 1. 右键操作菜单打开 → 关闭
+                app.set_ctx_visible(false);
+                st.ctx_image = None;
+            } else if app.get_search_visible() {
+                // 2. 名称过滤浮层打开 → 关闭（不改动现有过滤）
+                app.set_search_visible(false);
             } else if app.get_recent_visible() {
-                // 1. 最近工作区面板打开 → 关闭
+                // 3. 最近工作区面板打开 → 关闭
                 app.set_recent_visible(false);
             } else if app.get_text_input_visible() {
-                // 2. 文字输入中 → 取消输入
+                // 4. 文字输入中 → 取消输入
                 hide_text_input(&app);
                 app.set_status(SharedString::from("已取消文字输入"));
             } else if !matches!(st.interaction, Interaction::None) {
-                // 3. 有绘制/平移进行中 → 取消
+                // 5. 有绘制/平移进行中 → 取消
                 st.interaction = Interaction::None;
                 hide_previews(&app);
                 app.set_status(SharedString::from("已取消"));
             } else if app.get_active_tool() >= 0 {
-                // 4. 工具已激活且无绘制 → 退出工具回指针态（再点当前按钮亦可）
+                // 6. 工具已激活且无绘制 → 退出工具回指针态（再点当前按钮亦可）
                 app.set_active_tool(-1);
                 hide_text_input(&app);
                 app.set_status(SharedString::from("已退出工具 · 指针态（左键拖动平移）"));
             } else if app.get_minimal_mode() {
-                // 5. 极简模式且无绘制 → 退出极简
+                // 7. 极简模式且无绘制 → 退出极简
                 app.set_minimal_mode(false);
                 app.set_status(SharedString::from("已退出极简模式"));
             } else {
-                // 6. 完整模式无操作 → 提示入口
+                // 8. 完整模式无操作 → 提示入口
                 app.set_status(SharedString::from("极简模式: Ctrl+M"));
             }
         });
@@ -1565,38 +1693,39 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             st.last_click_row = row;
             st.last_click_at = now;
 
-            let dir_count = st.dirs.len() as i32;
-            if row < dir_count {
-                // 子目录行
-                let Some(dir) = st.dirs.get(row as usize).cloned() else {
-                    return;
-                };
-                if !is_double {
-                    let name = dir_display_name(&dir);
-                    app.set_status(SharedString::from(format!("双击进入子目录: {name}")));
-                    return;
+            // 行映射（受排序/过滤影响）：目录行 / 图片行分别取对应索引
+            match st.rows.get(row as usize).copied() {
+                Some(RowRef::Dir(d)) => {
+                    let Some(dir) = st.dirs.get(d).cloned() else {
+                        return;
+                    };
+                    if !is_double {
+                        let name = dir_display_name(&dir);
+                        app.set_status(SharedString::from(format!("双击进入子目录: {name}")));
+                        return;
+                    }
+                    // 双击 → 进入子目录（持久化旧标注 + 重扫 + 加载首图）
+                    persist_current(&mut st);
+                    st.nav_stack.push(dir);
+                    // 解码缓存按图片索引区分目录 → 目录变更时清空，防同索引命中旧目录图片
+                    if let Ok(mut c) = decode_cache.lock() {
+                        c.clear();
+                    }
+                    rescan_current(&app, &mut st);
+                    let count = st.files.len();
+                    drop(st);
+                    if count > 0 {
+                        load_image_by_index(&app, &state, 0, &load_seq, &load_queue, &decode_cache, &tip_timer);
+                    }
                 }
-                // 双击 → 进入子目录（持久化旧标注 + 重扫 + 加载首图）
-                persist_current(&mut st);
-                st.nav_stack.push(dir);
-                // 解码缓存按图片索引区分目录 → 目录变更时清空，防同索引命中旧目录图片
-                if let Ok(mut c) = decode_cache.lock() {
-                    c.clear();
+                Some(RowRef::Img(img_idx)) => {
+                    if img_idx >= st.files.len() {
+                        return;
+                    }
+                    drop(st);
+                    load_image_by_index(&app, &state, img_idx, &load_seq, &load_queue, &decode_cache, &tip_timer);
                 }
-                rescan_current(&app, &mut st);
-                let count = st.files.len();
-                drop(st);
-                if count > 0 {
-                    load_image_by_index(&app, &state, 0, &load_seq, &load_queue, &decode_cache, &tip_timer);
-                }
-            } else {
-                // 图片行（行号 - 目录数 = 图片索引）
-                let img_idx = (row - dir_count) as usize;
-                if img_idx >= st.files.len() {
-                    return;
-                }
-                drop(st);
-                load_image_by_index(&app, &state, img_idx, &load_seq, &load_queue, &decode_cache, &tip_timer);
+                None => {}
             }
         });
     }
@@ -1728,6 +1857,143 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         });
     }
     {
+        // 状态过滤循环：全部 → 未处理 → 已标注 → 已忽略（持久化偏好）
+        let weak = app.as_weak();
+        let state = state.clone();
+        app.on_filter_toggle(move || {
+            let (Some(app), mut st) = (weak.upgrade(), state.borrow_mut()) else {
+                return;
+            };
+            st.filter_status = (st.filter_status + 1) % 4;
+            app.set_filter_label(SharedString::from(filter_label(st.filter_status)));
+            storage::db::set_setting("filter_status", &st.filter_status.to_string());
+            rebuild_sidebar(&app, &mut st);
+            let msg = match st.filter_status {
+                1 => "过滤：仅未处理",
+                2 => "过滤：仅已标注",
+                3 => "过滤：仅已忽略",
+                _ => "过滤：全部",
+            };
+            app.set_status(SharedString::from(msg));
+        });
+    }
+    {
+        // 名称过滤：打开浮层（预填当前关键词）
+        let weak = app.as_weak();
+        let state = state.clone();
+        app.on_search_open(move || {
+            let (Some(app), st) = (weak.upgrade(), state.borrow()) else {
+                return;
+            };
+            app.set_search_draft(SharedString::from(st.filter_name.clone()));
+            app.set_search_visible(true);
+        });
+    }
+    {
+        // 应用名称过滤（空串 = 清除）
+        let weak = app.as_weak();
+        let state = state.clone();
+        app.on_search_apply(move || {
+            let (Some(app), mut st) = (weak.upgrade(), state.borrow_mut()) else {
+                return;
+            };
+            let kw = app.get_search_draft().to_string();
+            st.filter_name = kw.trim().to_lowercase();
+            let active = !st.filter_name.is_empty();
+            app.set_search_active(active);
+            app.set_search_visible(false);
+            rebuild_sidebar(&app, &mut st);
+            let msg = if active {
+                format!("名称过滤: {}", st.filter_name)
+            } else {
+                "已清除名称过滤".to_string()
+            };
+            app.set_status(SharedString::from(msg));
+        });
+    }
+    {
+        // 清除名称过滤
+        let weak = app.as_weak();
+        let state = state.clone();
+        app.on_search_clear(move || {
+            let (Some(app), mut st) = (weak.upgrade(), state.borrow_mut()) else {
+                return;
+            };
+            st.filter_name.clear();
+            app.set_search_draft(SharedString::from(""));
+            app.set_search_active(false);
+            app.set_search_visible(false);
+            rebuild_sidebar(&app, &mut st);
+            app.set_status(SharedString::from("已清除名称过滤"));
+        });
+    }
+    {
+        // 取消名称过滤浮层（不改动现有过滤）
+        let weak = app.as_weak();
+        app.on_search_cancel(move || {
+            if let Some(app) = weak.upgrade() {
+                app.set_search_visible(false);
+            }
+        });
+    }
+    {
+        // 右键菜单：重命名（复用重命名浮层）
+        let weak = app.as_weak();
+        let state = state.clone();
+        app.on_ctx_rename(move || {
+            let (Some(app), mut st) = (weak.upgrade(), state.borrow_mut()) else {
+                return;
+            };
+            app.set_ctx_visible(false);
+            let Some(img_idx) = st.ctx_image else {
+                return;
+            };
+            open_rename_dialog(&app, &mut st, img_idx);
+        });
+    }
+    {
+        // 右键菜单：状态标记（标记为已标注 / 已忽略 / 清除）
+        let app_done = app.as_weak();
+        let state_done = state.clone();
+        app.on_ctx_done(move || {
+            let (Some(app), mut st) = (app_done.upgrade(), state_done.borrow_mut()) else {
+                return;
+            };
+            app.set_ctx_visible(false);
+            mark_status(&app, &mut st, "done", "已标记为已标注");
+        });
+        let app_ign = app.as_weak();
+        let state_ign = state.clone();
+        app.on_ctx_ignored(move || {
+            let (Some(app), mut st) = (app_ign.upgrade(), state_ign.borrow_mut()) else {
+                return;
+            };
+            app.set_ctx_visible(false);
+            mark_status(&app, &mut st, "ignored", "已标记为已忽略");
+        });
+        let app_clr = app.as_weak();
+        let state_clr = state.clone();
+        app.on_ctx_clear(move || {
+            let (Some(app), mut st) = (app_clr.upgrade(), state_clr.borrow_mut()) else {
+                return;
+            };
+            app.set_ctx_visible(false);
+            mark_status(&app, &mut st, "pending", "已清除标记");
+        });
+    }
+    {
+        // 取消右键菜单
+        let weak = app.as_weak();
+        let state = state.clone();
+        app.on_ctx_cancel(move || {
+            let (Some(app), mut st) = (weak.upgrade(), state.borrow_mut()) else {
+                return;
+            };
+            app.set_ctx_visible(false);
+            st.ctx_image = None;
+        });
+    }
+    {
         // 最近工作区条目点击：切换到该工作区（等同命令行打开目录）
         let weak = app.as_weak();
         let state = state.clone();
@@ -1792,7 +2058,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         });
     }
     {
-        // 右键图片行（列表/网格）→ 打开重命名浮层（预填当前文件名）
+        // 右键图片行（列表/网格）→ 打开操作菜单（重命名 / 状态标记）
         let weak = app.as_weak();
         let state = state.clone();
         app.on_rename_row(move || {
@@ -1804,18 +2070,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 return;
             }
             let Some(img_idx) = row_to_image(&st, row as i64) else {
-                app.set_status(SharedString::from("子目录不支持重命名"));
+                app.set_status(SharedString::from("子目录不支持此操作"));
                 return;
             };
-            let old = st.files[img_idx].clone();
-            let fname = std::path::Path::new(&old)
-                .file_name()
-                .map(|s| s.to_string_lossy().into_owned())
-                .unwrap_or_else(|| old.clone());
-            st.rename_pending = Some((old, img_idx));
-            app.set_rename_title(SharedString::from(format!("重命名: {fname}")));
-            app.set_rename_draft(SharedString::from(fname));
-            app.set_rename_visible(true);
+            let Some(path) = st.files.get(img_idx).cloned() else {
+                return;
+            };
+            st.ctx_image = Some(img_idx);
+            app.set_ctx_title(SharedString::from(dir_display_name(&path)));
+            app.set_ctx_visible(true);
         });
     }
     {
@@ -2131,4 +2394,50 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     std::mem::drop(timer);
     std::mem::drop(load_timer);
     Ok(())
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn s(v: &[&str]) -> Vec<String> {
+        v.iter().map(|x| x.to_string()).collect()
+    }
+
+    /// 状态过滤：未处理/已标注/已忽略 各自只保留对应状态
+    #[test]
+    fn filter_by_status() {
+        let files = s(&["a.png", "b.png", "c.png"]);
+        let dirs = s(&["sub"]);
+        let statuses = vec![0, 1, 2]; // 未处理 / 已标注 / 已忽略
+        let (d, i) = filter_indices(&dirs, &files, &statuses, 0, "");
+        assert_eq!((d.len(), i.len()), (1, 3), "全部：目录与图片都可见");
+        let (_, i) = filter_indices(&dirs, &files, &statuses, 1, "");
+        assert_eq!(i, vec![0], "仅未处理");
+        let (_, i) = filter_indices(&dirs, &files, &statuses, 2, "");
+        assert_eq!(i, vec![1], "仅已标注");
+        let (_, i) = filter_indices(&dirs, &files, &statuses, 3, "");
+        assert_eq!(i, vec![2], "仅已忽略");
+    }
+
+    /// 名称过滤：不区分大小写包含匹配；目录同样受名称过滤
+    #[test]
+    fn filter_by_name_case_insensitive() {
+        let files = s(&["Login-Error.PNG", "home.png"]);
+        let dirs = s(&["LoginShots", "other"]);
+        let statuses = vec![0, 0];
+        let (d, i) = filter_indices(&dirs, &files, &statuses, 0, "login");
+        assert_eq!(d.len(), 1, "目录按名称过滤");
+        assert_eq!(i, vec![0], "图片按名称过滤（忽略大小写）");
+    }
+
+    /// 状态 + 名称 组合过滤
+    #[test]
+    fn filter_status_and_name_combined() {
+        let files = s(&["login.png", "login2.png", "home.png"]);
+        let statuses = vec![1, 0, 0];
+        let (_, i) = filter_indices(&[], &files, &statuses, 2, "login");
+        assert_eq!(i, vec![0], "已标注 且 名称含 login");
+    }
 }

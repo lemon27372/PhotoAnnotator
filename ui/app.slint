@@ -279,6 +279,24 @@ export component AppWindow inherits Window {
     callback sort-toggle;
     // 列表/网格视图切换（Rust 持久化偏好）
     callback view-changed;
+    // 过滤：状态循环（全部/未处理/已标注/已忽略）+ 名称搜索
+    in-out property <string> filter-label: "全";
+    in-out property <bool> search-active: false;
+    callback filter-toggle;
+    callback search-open;
+    in-out property <bool> search-visible: false;
+    in-out property <string> search-draft: "";
+    callback search-apply;
+    callback search-clear;
+    callback search-cancel;
+    // 条目右键操作菜单（重命名 / 状态标记）
+    in-out property <bool> ctx-visible: false;
+    in-out property <string> ctx-title: "";
+    callback ctx-rename;
+    callback ctx-done;
+    callback ctx-ignored;
+    callback ctx-clear;
+    callback ctx-cancel;
     // 侧边栏信息（图/目录计数）
     in-out property <string> sidebar-meta: "";
     // 切图加载中（画布中央浮层）
@@ -498,6 +516,24 @@ export component AppWindow inherits Window {
                             }
                         }
                         Rectangle { width: 4px; }
+                        // 状态过滤（循环：全部 → 未处理 → 已标注 → 已忽略）
+                        SideBtn {
+                            label: root.filter-label;
+                            active: root.filter-label != "全";
+                            clicked => {
+                                root.filter-toggle();
+                                canvas-fs.focus();
+                            }
+                        }
+                        // 名称搜索（打开过滤输入浮层）
+                        SideBtn {
+                            label: "搜";
+                            active: root.search-active;
+                            clicked => {
+                                root.search-open();
+                                search-scope.focus();
+                            }
+                        }
                         // 排序模式（循环切换：名称/时间 × 升/降）
                         SideBtn {
                             label: root.sort-label;
@@ -507,21 +543,12 @@ export component AppWindow inherits Window {
                                 canvas-fs.focus();
                             }
                         }
+                        // 列表/网格切换（单按钮循环，label 显示当前视图）
                         SideBtn {
-                            label: "列表";
-                            active: root.view-mode == 0;
-                            clicked => {
-                                root.view-mode = 0;
-                                root.view-changed();
-                                root.recent-visible = false;
-                                canvas-fs.focus();
-                            }
-                        }
-                        SideBtn {
-                            label: "网格";
+                            label: root.view-mode == 0 ? "列" : "网";
                             active: root.view-mode == 1;
                             clicked => {
-                                root.view-mode = 1;
+                                root.view-mode = root.view-mode == 0 ? 1 : 0;
                                 root.view-changed();
                                 root.recent-visible = false;
                                 canvas-fs.focus();
@@ -548,12 +575,11 @@ export component AppWindow inherits Window {
                                     root.select-file();
                                     canvas-fs.focus();
                                 }
-                                // 右键图片行 = 重命名（打开浮层并聚焦输入框）
+                                // 右键图片行 = 打开操作菜单（重命名 / 状态标记）
                                 pointer-event(event) => {
                                     if event.button == PointerEventButton.right && event.kind == PointerEventKind.down {
                                         root.clicked-rename-file = idx;
                                         root.rename-row();
-                                        rename-scope.focus();
                                     }
                                 }
                                 // 内容垂直居中（行高 46）
@@ -633,9 +659,9 @@ export component AppWindow inherits Window {
                                 padding-left: 4px;
                                 padding-right: 4px;
                                 spacing: 6px;
-                                GridCell { entry: row.c0; gidx: ri * 3 + 0; current-row: root.current-row; clicked => { root.clicked-file = self.gidx; root.select-file(); canvas-fs.focus(); } rename-clicked => { root.clicked-rename-file = self.gidx; root.rename-row(); rename-scope.focus(); } }
-                                GridCell { entry: row.c1; gidx: ri * 3 + 1; current-row: root.current-row; clicked => { root.clicked-file = self.gidx; root.select-file(); canvas-fs.focus(); } rename-clicked => { root.clicked-rename-file = self.gidx; root.rename-row(); rename-scope.focus(); } }
-                                GridCell { entry: row.c2; gidx: ri * 3 + 2; current-row: root.current-row; clicked => { root.clicked-file = self.gidx; root.select-file(); canvas-fs.focus(); } rename-clicked => { root.clicked-rename-file = self.gidx; root.rename-row(); rename-scope.focus(); } }
+                                GridCell { entry: row.c0; gidx: ri * 3 + 0; current-row: root.current-row; clicked => { root.clicked-file = self.gidx; root.select-file(); canvas-fs.focus(); } rename-clicked => { root.clicked-rename-file = self.gidx; root.rename-row(); } }
+                                GridCell { entry: row.c1; gidx: ri * 3 + 1; current-row: root.current-row; clicked => { root.clicked-file = self.gidx; root.select-file(); canvas-fs.focus(); } rename-clicked => { root.clicked-rename-file = self.gidx; root.rename-row(); } }
+                                GridCell { entry: row.c2; gidx: ri * 3 + 2; current-row: root.current-row; clicked => { root.clicked-file = self.gidx; root.select-file(); canvas-fs.focus(); } rename-clicked => { root.clicked-rename-file = self.gidx; root.rename-row(); } }
                             }
                         }
                     }
@@ -979,6 +1005,103 @@ export component AppWindow inherits Window {
                     text: "取消";
                     clicked => { root.rename-cancel(); canvas-fs.focus(); }
                 }
+            }
+        }
+    }
+
+    // ---- 名称过滤浮层（Enter 应用；留空=不过滤）----
+    search-dialog := Rectangle {
+        visible: root.search-visible;
+        x: (root.width - 340px) / 2;
+        y: (root.height - 116px) / 2;
+        width: 340px;
+        height: 112px;
+        background: #FFFFFF;
+        border-radius: 8px;
+        border-width: 1px;
+        border-color: #4A90D9;
+        VerticalLayout {
+            padding-left: 12px;
+            padding-right: 12px;
+            padding-top: 10px;
+            padding-bottom: 10px;
+            spacing: 8px;
+            Text {
+                text: "按名称过滤（留空 = 显示全部）";
+                font-size: 12px;
+                font-weight: 600;
+                color: #212121;
+            }
+            search-scope := FocusScope {
+                forward-focus: search-input;
+                KeyBinding { keys: @keys(Escape); activated => { root.search-cancel(); canvas-fs.focus(); } }
+                search-input := InlineTextInput {
+                    text <=> root.search-draft;
+                    accepted => { root.search-apply(); canvas-fs.focus(); }
+                }
+            }
+            HorizontalLayout {
+                alignment: end;
+                spacing: 8px;
+                Button {
+                    text: "应用";
+                    clicked => { root.search-apply(); canvas-fs.focus(); }
+                }
+                Button {
+                    text: "清除";
+                    clicked => { root.search-clear(); canvas-fs.focus(); }
+                }
+                Button {
+                    text: "取消";
+                    clicked => { root.search-cancel(); canvas-fs.focus(); }
+                }
+            }
+        }
+    }
+
+    // ---- 条目右键操作菜单（重命名 / 状态标记）----
+    ctx-menu := Rectangle {
+        visible: root.ctx-visible;
+        x: (root.width - 260px) / 2;
+        y: (root.height - 226px) / 2;
+        width: 260px;
+        height: 222px;
+        background: #FFFFFF;
+        border-radius: 8px;
+        border-width: 1px;
+        border-color: #4A90D9;
+        VerticalLayout {
+            padding-left: 12px;
+            padding-right: 12px;
+            padding-top: 10px;
+            padding-bottom: 10px;
+            spacing: 6px;
+            Text {
+                text: root.ctx-title;
+                font-size: 12px;
+                font-weight: 600;
+                color: #212121;
+                overflow: elide;
+            }
+            Button {
+                text: "重命名";
+                clicked => { root.ctx-rename(); canvas-fs.focus(); }
+            }
+            Button {
+                text: "标记为已标注";
+                clicked => { root.ctx-done(); canvas-fs.focus(); }
+            }
+            Button {
+                text: "标记为已忽略";
+                clicked => { root.ctx-ignored(); canvas-fs.focus(); }
+            }
+            Button {
+                text: "清除标记（未处理）";
+                clicked => { root.ctx-clear(); canvas-fs.focus(); }
+            }
+            Button {
+                text: "取消";
+                clicked => { root.ctx-cancel(); canvas-fs.focus(); }
             }
         }
     }
