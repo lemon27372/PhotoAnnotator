@@ -15,6 +15,10 @@ pub enum Tool {
     Arrow = 2,
     Pen = 3,
     Text = 4,
+    /// 马赛克（拖框像素化，用于敏感信息打码）
+    Mosaic = 5,
+    /// 序号标记（单击放置递增圆圈编号）
+    Number = 6,
 }
 
 impl Tool {
@@ -24,6 +28,8 @@ impl Tool {
             2 => Tool::Arrow,
             3 => Tool::Pen,
             4 => Tool::Text,
+            5 => Tool::Mosaic,
+            6 => Tool::Number,
             _ => Tool::Rect,
         }
     }
@@ -34,6 +40,9 @@ pub const DEFAULT_COLOR: u32 = 0xF44336; // 错误红
 pub const DEFAULT_STROKE_WIDTH: f32 = 3.0; // 框类（矩形/椭圆）线宽，图片像素
 pub const ARROW_STROKE_WIDTH: f32 = 5.0; // 箭头线宽（视觉上应比框粗，图片像素）
 pub const DEFAULT_FONT_SIZE: f32 = 24.0; // 文字标注字号（图片像素）
+pub const MOSAIC_BLOCK: f32 = 12.0; // 马赛克块边长（图片像素，固定粒度）
+pub const NUMBER_RADIUS: f32 = 18.0; // 序号圆半径（图片像素）
+pub const NUMBER_FONT_SIZE: f32 = 22.0; // 序号数字字号（图片像素）
 
 /// 通用"框形"标注数据：外接矩形两点式（图片像素坐标）+ 样式
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
@@ -118,7 +127,16 @@ pub struct PenShape {
     pub width: f32,
 }
 
-/// 统一的标注图元（后续扩展 Text…）
+/// 序号标注：圆心（图片像素坐标）+ 编号（每张图独立从 1 递增）
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct NumberShape {
+    pub x: f32,
+    pub y: f32,
+    pub value: u32,
+    pub color: u32, // 0xRRGGBB（圆底）
+}
+
+/// 统一的标注图元
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub enum Annotation {
     Rect(BoxShape),
@@ -126,6 +144,10 @@ pub enum Annotation {
     Arrow(LineShape),
     Pen(PenShape),
     Text(TextAnnotation),
+    /// 马赛克区域（渲染/导出时从基底像素取样像素化）
+    Mosaic(BoxShape),
+    /// 序号圆圈
+    Number(NumberShape),
 }
 
 /// 文字标注：锚点为文字左上角（图片像素坐标）
@@ -174,13 +196,26 @@ impl Annotation {
         })
     }
 
+    /// 构造马赛克区域（外接矩形两点式；渲染时按 MOSAIC_BLOCK 取样像素化）
+    pub fn mosaic(x1: f32, y1: f32, x2: f32, y2: f32) -> Self {
+        Annotation::Mosaic(BoxShape::normalized(x1, y1, x2, y2))
+    }
+
+    /// 构造序号标记（圆心 + 编号，默认红色圆底）
+    pub fn number(x: f32, y: f32, value: u32) -> Self {
+        Annotation::Number(NumberShape { x, y, value, color: DEFAULT_COLOR })
+    }
+
     /// 图元是否有有效面积/长度
     pub fn has_area(&self) -> bool {
         match self {
-            Annotation::Rect(b) | Annotation::Ellipse(b) => b.has_area(),
+            Annotation::Rect(b)
+            | Annotation::Ellipse(b)
+            | Annotation::Mosaic(b) => b.has_area(),
             Annotation::Arrow(l) => l.length() > 2.0,
             Annotation::Pen(p) => p.points.len() >= 2,
             Annotation::Text(t) => !t.text.trim().is_empty(),
+            Annotation::Number(_) => true,
         }
     }
 }
@@ -237,5 +272,65 @@ impl AnnotationStore {
 
     pub fn len(&self) -> usize {
         self.items.len()
+    }
+
+    /// 下一个序号编号（当前图内已有序号最大值 + 1，每图独立从 1 开始）
+    pub fn next_number(&self) -> u32 {
+        self.items
+            .iter()
+            .filter_map(|a| match a {
+                Annotation::Number(n) => Some(n.value),
+                _ => None,
+            })
+            .max()
+            .unwrap_or(0)
+            + 1
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 全类型 serde 往返（含新增马赛克/序号）：持久化与切图恢复依赖此路径
+    #[test]
+    fn annotation_json_round_trip() {
+        let mut store = AnnotationStore::new();
+        store.push(Annotation::rect(1.0, 2.0, 30.0, 40.0));
+        store.push(Annotation::ellipse(5.0, 6.0, 20.0, 25.0));
+        store.push(Annotation::arrow(0.0, 0.0, 50.0, 50.0));
+        store.push(Annotation::pen(vec![(1.0, 1.0), (3.0, 4.0)]));
+        store.push(Annotation::text(7.0, 8.0, "标注".into()));
+        store.push(Annotation::mosaic(10.0, 10.0, 60.0, 40.0));
+        store.push(Annotation::number(15.0, 20.0, 3));
+
+        let json = store.to_json();
+        let items = AnnotationStore::from_json(&json);
+        assert_eq!(items.len(), 7);
+        assert!(matches!(&items[5], Annotation::Mosaic(b) if (b.x2 - b.x1 - 50.0).abs() < 0.01));
+        assert!(matches!(&items[6], Annotation::Number(n) if n.value == 3 && n.x == 15.0));
+    }
+
+    /// 序号编号：每图独立、取当前最大值 +1；空集从 1 开始
+    #[test]
+    fn next_number_increments_and_restarts() {
+        let mut store = AnnotationStore::new();
+        assert_eq!(store.next_number(), 1);
+        store.push(Annotation::number(1.0, 1.0, 1));
+        store.push(Annotation::number(2.0, 2.0, 2));
+        assert_eq!(store.next_number(), 3);
+        // 撤销最后一个后编号可重用
+        assert!(store.undo());
+        assert_eq!(store.next_number(), 2);
+        // 新图（新 store）重新从 1 开始
+        assert_eq!(AnnotationStore::new().next_number(), 1);
+    }
+
+    /// 零尺寸马赛克/矩形视为无效（与既有 has_area 语义一致）
+    #[test]
+    fn zero_size_shapes_rejected() {
+        assert!(!Annotation::mosaic(10.0, 10.0, 10.0, 30.0).has_area());
+        assert!(Annotation::mosaic(10.0, 10.0, 40.0, 30.0).has_area());
+        assert!(Annotation::number(1.0, 1.0, 1).has_area());
     }
 }

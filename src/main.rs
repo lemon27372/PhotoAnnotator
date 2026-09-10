@@ -134,10 +134,11 @@ fn show_arrow_preview(app: &AppWindow, x1: f32, y1: f32, x2: f32, y2: f32) {
 /// 按当前工具显示对应的预览
 fn show_preview(app: &AppWindow, tool: Tool, x1: f32, y1: f32, x2: f32, y2: f32) {
     match tool {
-        Tool::Rect => show_rect_preview(app, x1, y1, x2, y2),
+        // 马赛克与矩形同为拖框：复用矩形预览
+        Tool::Rect | Tool::Mosaic => show_rect_preview(app, x1, y1, x2, y2),
         Tool::Ellipse => show_ellipse_preview(app, x1, y1, x2, y2),
         Tool::Arrow => show_arrow_preview(app, x1, y1, x2, y2),
-        Tool::Pen | Tool::Text => {}
+        Tool::Pen | Tool::Text | Tool::Number => {}
     }
 }
 
@@ -1109,7 +1110,7 @@ fn apply_load_result(
 }
 
 /// 重渲染标注层（仅已完成的图元）并推到 Slint
-/// 同时同步文字标注列表到 Slint 显示层（撤销/新增后调用）
+/// 同时同步文字/序号标注到 Slint 显示层（撤销/新增后调用）
 fn update_overlay(app: &AppWindow, state: &AppState) {
     if state.store.items.is_empty() {
         // 无标注：置 1x1 透明 overlay，避免全图重建/上传
@@ -1120,6 +1121,7 @@ fn update_overlay(app: &AppWindow, state: &AppState) {
         state.image_width,
         state.image_height,
         &state.store,
+        &state.image_rgba, // 马赛克需从基底像素取样
     ) {
         let mut buffer = SharedPixelBuffer::<Rgba8Pixel>::new(w, h);
         buffer.make_mut_bytes().copy_from_slice(&bytes);
@@ -1141,6 +1143,24 @@ fn update_overlay(app: &AppWindow, state: &AppState) {
         })
         .collect();
     app.set_text_annotations(slint::ModelRc::from(std::rc::Rc::new(slint::VecModel::from(texts))));
+    // 序号标注走 Slint 原生圆 + Text 显示（导出时由渲染层栅格化）
+    let numbers: Vec<NumberDisplay> = state
+        .store
+        .items
+        .iter()
+        .filter_map(|a| match a {
+            canvas::Annotation::Number(n) => Some(NumberDisplay {
+                x: n.x,
+                y: n.y,
+                value: n.value as i32,
+                radius: canvas::annotation::NUMBER_RADIUS,
+            }),
+            _ => None,
+        })
+        .collect();
+    app.set_number_annotations(slint::ModelRc::from(std::rc::Rc::new(slint::VecModel::from(
+        numbers,
+    ))));
 }
 
 /// 隐藏文字输入框并清空草稿
@@ -1169,7 +1189,8 @@ fn annotation_from_shape(tool: Tool, x1: f32, y1: f32, x2: f32, y2: f32) -> Anno
         Tool::Rect => Annotation::rect(x1, y1, x2, y2),
         Tool::Ellipse => Annotation::ellipse(x1, y1, x2, y2),
         Tool::Arrow => Annotation::arrow(x1, y1, x2, y2),
-        Tool::Pen | Tool::Text => unreachable!("非两点式工具不走此创建路径"),
+        Tool::Mosaic => Annotation::mosaic(x1, y1, x2, y2),
+        Tool::Pen | Tool::Text | Tool::Number => unreachable!("非两点式工具不走此创建路径"),
     }
 }
 
@@ -1322,6 +1343,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     Tool::Arrow => "箭头工具：从起点拖到终点（中键/右键拖动平移）",
                     Tool::Pen => "画笔工具：按住左键手绘（中键/右键拖动平移）",
                     Tool::Text => "文字工具：点击画布放置文字（中键/右键拖动平移）",
+                    Tool::Mosaic => "马赛克工具：拖出需要打码的区域（敏感信息遮挡）",
+                    Tool::Number => "序号工具：点击画布放置递增编号（每图从 1 开始）",
                 }
             };
             app.set_status(SharedString::from(msg));
@@ -1912,14 +1935,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 hide_text_input(&app);
             }
             match current_tool {
-                Tool::Rect | Tool::Ellipse | Tool::Arrow => {
+                // 马赛克与矩形/椭圆/箭头同为拖框式
+                Tool::Rect | Tool::Ellipse | Tool::Arrow | Tool::Mosaic => {
                     // 绘制前固化为自由模式，保证坐标换算使用真实视图变换
                     ensure_free(&app);
                     hide_previews(&app);
                     let (ix, iy) = read_transform(&app).canvas_to_image(cx, cy);
                     st.interaction =
                         Interaction::DrawingShape { start: (ix, iy), current: (ix, iy) };
-                    app.set_status(SharedString::from("绘制中 · 拖拽成形"));
+                    let msg = if current_tool == Tool::Mosaic {
+                        "马赛克 · 拖出打码区域"
+                    } else {
+                        "绘制中 · 拖拽成形"
+                    };
+                    app.set_status(SharedString::from(msg));
                 }
                 Tool::Pen => {
                     ensure_free(&app);
@@ -1942,6 +1971,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     app.set_text_draft(SharedString::from(""));
                     app.set_text_input_visible(true);
                     app.set_status(SharedString::from("输入文字后按 Enter 确认"));
+                }
+                Tool::Number => {
+                    // 单击放置：序号 = 本图已有序号最大值 + 1（每图独立从 1 开始）
+                    ensure_free(&app);
+                    hide_previews(&app);
+                    let (ix, iy) = read_transform(&app).canvas_to_image(cx, cy);
+                    let value = st.store.next_number();
+                    st.store.push(canvas::Annotation::number(ix, iy, value));
+                    update_overlay(&app, &st);
+                    app.set_status(SharedString::from(format!("已放置序号 {value}")));
                 }
             }
         });
