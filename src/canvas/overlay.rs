@@ -409,3 +409,38 @@ fn unpremultiply(data: &[u8]) -> Vec<u8> {
     }
     out
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::canvas::annotation::Annotation;
+
+    /// 马赛克在**导出合成路径**生效：黑白棋盘基底被整块平均成统一颜色
+    #[test]
+    fn mosaic_pixelates_base_in_composite() {
+        let (w, h) = (8u32, 8u32);
+        let mut bg = vec![0u8; (w * h * 4) as usize];
+        for y in 0..h {
+            for x in 0..w {
+                let i = ((y * w + x) * 4) as usize;
+                let v = if x < 4 { 0u8 } else { 255u8 }; // 左黑右白
+                bg[i] = v;
+                bg[i + 1] = v;
+                bg[i + 2] = v;
+                bg[i + 3] = 255;
+            }
+        }
+        let mut store = AnnotationStore::new();
+        store.push(Annotation::mosaic(0.0, 0.0, w as f32, h as f32)); // 覆盖整图
+        let rgba = composite_rgba(w, h, &bg, &store).expect("composite 应成功");
+        assert_eq!(rgba.len(), (w * h * 4) as usize);
+        // 整图落在一个 12px 块内 → 所有像素取同一平均色，棋盘纹路消失
+        let first = rgba[0];
+        assert!(
+            rgba.chunks_exact(4).all(|p| p[0] == first && p[3] == 255),
+            "马赛克后区域颜色应统一且不透明"
+        );
+        // 平均色应远离原始黑/白极值（说明确实做了取样平均）
+        assert!(first > 40 && first < 215, "平均色应居中，实际 {first}");
+    }
+}
