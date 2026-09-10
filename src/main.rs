@@ -138,7 +138,7 @@ fn show_preview(app: &AppWindow, tool: Tool, x1: f32, y1: f32, x2: f32, y2: f32)
         Tool::Rect | Tool::Mosaic => show_rect_preview(app, x1, y1, x2, y2),
         Tool::Ellipse => show_ellipse_preview(app, x1, y1, x2, y2),
         Tool::Arrow => show_arrow_preview(app, x1, y1, x2, y2),
-        Tool::Pen | Tool::Text | Tool::Number => {}
+        Tool::Pen | Tool::Text => {}
     }
 }
 
@@ -1143,24 +1143,6 @@ fn update_overlay(app: &AppWindow, state: &AppState) {
         })
         .collect();
     app.set_text_annotations(slint::ModelRc::from(std::rc::Rc::new(slint::VecModel::from(texts))));
-    // 序号标注走 Slint 原生圆 + Text 显示（导出时由渲染层栅格化）
-    let numbers: Vec<NumberDisplay> = state
-        .store
-        .items
-        .iter()
-        .filter_map(|a| match a {
-            canvas::Annotation::Number(n) => Some(NumberDisplay {
-                x: n.x,
-                y: n.y,
-                value: n.value as i32,
-                radius: canvas::annotation::NUMBER_RADIUS,
-            }),
-            _ => None,
-        })
-        .collect();
-    app.set_number_annotations(slint::ModelRc::from(std::rc::Rc::new(slint::VecModel::from(
-        numbers,
-    ))));
 }
 
 /// 隐藏文字输入框并清空草稿
@@ -1190,7 +1172,7 @@ fn annotation_from_shape(tool: Tool, x1: f32, y1: f32, x2: f32, y2: f32) -> Anno
         Tool::Ellipse => Annotation::ellipse(x1, y1, x2, y2),
         Tool::Arrow => Annotation::arrow(x1, y1, x2, y2),
         Tool::Mosaic => Annotation::mosaic(x1, y1, x2, y2),
-        Tool::Pen | Tool::Text | Tool::Number => unreachable!("非两点式工具不走此创建路径"),
+        Tool::Pen | Tool::Text => unreachable!("非两点式工具不走此创建路径"),
     }
 }
 
@@ -1344,7 +1326,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     Tool::Pen => "画笔工具：按住左键手绘（中键/右键拖动平移）",
                     Tool::Text => "文字工具：点击画布放置文字（中键/右键拖动平移）",
                     Tool::Mosaic => "马赛克工具：拖出需要打码的区域（敏感信息遮挡）",
-                    Tool::Number => "序号工具：点击画布放置递增编号（每图从 1 开始）",
                 }
             };
             app.set_status(SharedString::from(msg));
@@ -1971,16 +1952,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     app.set_text_draft(SharedString::from(""));
                     app.set_text_input_visible(true);
                     app.set_status(SharedString::from("输入文字后按 Enter 确认"));
-                }
-                Tool::Number => {
-                    // 单击放置：序号 = 本图已有序号最大值 + 1（每图独立从 1 开始）
-                    ensure_free(&app);
-                    hide_previews(&app);
-                    let (ix, iy) = read_transform(&app).canvas_to_image(cx, cy);
-                    let value = st.store.next_number();
-                    st.store.push(canvas::Annotation::number(ix, iy, value));
-                    update_overlay(&app, &st);
-                    app.set_status(SharedString::from(format!("已放置序号 {value}")));
                 }
             }
         });

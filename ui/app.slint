@@ -40,14 +40,6 @@ export struct TextDisplay {
     font-size: float,
 }
 
-/// 序号标注的显示项（图片坐标；圆底 + 数字，随视图变换缩放）
-export struct NumberDisplay {
-    x: float,
-    y: float,
-    value: int,
-    radius: float,
-}
-
 /// 工作目录文件列表项（列表/网格共用；网格占位项 kind=-1）
 export struct FileEntry {
     path: string,
@@ -239,8 +231,6 @@ export component AppWindow inherits Window {
     in-out property <length> preview-stroke-width: 3px;
     // ---- 文字标注显示（Slint 原生 Text，随视图缩放）----
     in-out property <[TextDisplay]> text-annotations: [];
-    // ---- 序号标注显示（Slint 原生圆 + Text，随视图缩放）----
-    in-out property <[NumberDisplay]> number-annotations: [];
     // 文字输入框（画布坐标定位；Enter 提交）
     in-out property <bool> text-input-visible: false;
     in-out property <length> text-input-x: 0px;
@@ -384,15 +374,6 @@ export component AppWindow inherits Window {
                 checked: root.active-tool == 5;
                 clicked => {
                     root.active-tool = root.active-tool == 5 ? -1 : 5;
-                    root.tool-changed();
-                    canvas-fs.focus();
-                }
-            }
-            Button {
-                text: "序号";
-                checked: root.active-tool == 6;
-                clicked => {
-                    root.active-tool = root.active-tool == 6 ? -1 : 6;
                     root.tool-changed();
                     canvas-fs.focus();
                 }
@@ -744,14 +725,12 @@ export component AppWindow inherits Window {
                 KeyBinding { enabled: !root.text-input-visible; keys: @keys("4"); activated => { root.active-tool = 3; root.tool-changed(); } }
                 KeyBinding { enabled: !root.text-input-visible; keys: @keys("5"); activated => { root.active-tool = 4; root.tool-changed(); } }
                 KeyBinding { enabled: !root.text-input-visible; keys: @keys("6"); activated => { root.active-tool = 5; root.tool-changed(); } }
-                KeyBinding { enabled: !root.text-input-visible; keys: @keys("7"); activated => { root.active-tool = 6; root.tool-changed(); } }
                 KeyBinding { enabled: !root.text-input-visible; keys: @keys("r"); activated => { root.active-tool = 0; root.tool-changed(); } }
                 KeyBinding { enabled: !root.text-input-visible; keys: @keys("o"); activated => { root.active-tool = 1; root.tool-changed(); } }
                 KeyBinding { enabled: !root.text-input-visible; keys: @keys("a"); activated => { root.active-tool = 2; root.tool-changed(); } }
                 KeyBinding { enabled: !root.text-input-visible; keys: @keys("p"); activated => { root.active-tool = 3; root.tool-changed(); } }
                 KeyBinding { enabled: !root.text-input-visible; keys: @keys("t"); activated => { root.active-tool = 4; root.tool-changed(); } }
                 KeyBinding { enabled: !root.text-input-visible; keys: @keys("m"); activated => { root.active-tool = 5; root.tool-changed(); } }
-                KeyBinding { enabled: !root.text-input-visible; keys: @keys("n"); activated => { root.active-tool = 6; root.tool-changed(); } }
                 KeyBinding { enabled: !root.text-input-visible; keys: @keys(Control+Z); activated => { root.undo(); } }
                 KeyBinding { enabled: !root.text-input-visible; keys: @keys(Control+C); activated => { root.copy(); } }
                 KeyBinding { enabled: !root.text-input-visible; keys: @keys(Control+S); activated => { root.save(); } }
@@ -814,25 +793,6 @@ export component AppWindow inherits Window {
                     text: item.text;
                     font-size: item.font-size * 1px * root.disp-scale;
                     color: #F44336;
-                }
-
-                // 序号标注显示（圆底 + 白色数字；随视图缩放）
-                for num in root.number-annotations: Rectangle {
-                    x: root.disp-x + (num.x - num.radius) * 1px * root.disp-scale;
-                    y: root.disp-y + (num.y - num.radius) * 1px * root.disp-scale;
-                    width: num.radius * 2px * root.disp-scale;
-                    height: num.radius * 2px * root.disp-scale;
-                    border-radius: num.radius * 1px * root.disp-scale;
-                    background: #F44336;
-                    Text {
-                        width: 100%;
-                        height: 100%;
-                        horizontal-alignment: center;
-                        vertical-alignment: center;
-                        text: "\{num.value}";
-                        color: #FFFFFF;
-                        font-size: num.radius * 1px * root.disp-scale;
-                    }
                 }
 
                 // 手势层

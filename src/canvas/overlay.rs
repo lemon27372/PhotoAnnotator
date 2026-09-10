@@ -5,7 +5,7 @@
 
 use tiny_skia::{Color, LineCap, Paint, Path, PathBuilder, Pixmap, Rect, Shader, Stroke, Transform};
 
-use super::annotation::{Annotation, AnnotationStore, MOSAIC_BLOCK, NUMBER_FONT_SIZE, NUMBER_RADIUS};
+use super::annotation::{Annotation, AnnotationStore, MOSAIC_BLOCK};
 
 /// 渲染标注层，返回 (宽, 高, straight-alpha RGBA 字节)
 /// 仅矢量图元入 overlay 位图；文字/序号由 Slint 元素显示（此处跳过）
@@ -185,12 +185,6 @@ fn draw_annotation(
             // 马赛克：从基底像素分块取样（overlay 显示与导出合成共用同一条路径）
             draw_mosaic(pixmap, b, base);
         }
-        Annotation::Number(n) => {
-            // 序号：圆底 + 白色数字（导出/合成时栅格化；画布显示由 Slint 元素负责）
-            if let Some(font) = font {
-                draw_number(pixmap, n, font);
-            }
-        }
     }
 }
 
@@ -262,47 +256,6 @@ fn draw_mosaic(
             bx = ex;
         }
         by = ey;
-    }
-}
-
-/// 序号：实心圆底 + 白色数字（水平/垂直居中）
-fn draw_number(
-    pixmap: &mut Pixmap,
-    n: &super::annotation::NumberShape,
-    font: &fontdue::Font,
-) {
-    let mut pb = PathBuilder::new();
-    pb.push_circle(n.x, n.y, NUMBER_RADIUS);
-    if let Some(path) = pb.finish() {
-        let paint = Paint {
-            shader: Shader::SolidColor(color_from_u32(n.color)),
-            ..Default::default()
-        };
-        pixmap.fill_path(
-            &path,
-            &paint,
-            tiny_skia::FillRule::Winding,
-            Transform::identity(),
-            None,
-        );
-    }
-    let text = n.value.to_string();
-    let size = NUMBER_FONT_SIZE;
-    let total_w: f32 = text
-        .chars()
-        .map(|c| font.metrics(c, size).advance_width)
-        .sum();
-    let metrics = font.horizontal_line_metrics(size);
-    let ascent = metrics.as_ref().map(|m| m.ascent).unwrap_or(size * 0.8);
-    let descent = metrics.as_ref().map(|m| m.descent).unwrap_or(size * 0.2);
-    let baseline = n.y + (ascent - descent) * 0.5;
-    let mut pen_x = n.x - total_w * 0.5;
-    for ch in text.chars() {
-        let (m, coverage) = font.rasterize(ch, size);
-        let px = pen_x + m.xmin as f32;
-        let py = baseline - m.ymin as f32 - m.height as f32;
-        blend_coverage(pixmap, px, py, m.width as u32, m.height as u32, &coverage, 255.0, 255.0, 255.0);
-        pen_x += m.advance_width;
     }
 }
 
