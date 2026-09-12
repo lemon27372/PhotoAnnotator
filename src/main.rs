@@ -601,6 +601,17 @@ fn thumb_ctx() -> &'static ThumbCtx {
     })
 }
 
+/// 作废所有在途缩略图任务（递增轮次 → 旧结果被丢弃）
+/// 必须在"图片内容变化"（保存覆盖原图）与"目录切换/刷新"时调用：
+/// 否则保存前发起的旧任务会把旧缩略图写回内存与 DB，列表显示不更新
+fn invalidate_thumbs() {
+    let ctx = thumb_ctx();
+    ctx.round.fetch_add(1, Ordering::Relaxed);
+    if let Ok(mut q) = ctx.results.lock() {
+        q.clear();
+    }
+}
+
 /// 只读缩略图（内存缓存 → DB 缓存）；未命中返回 None，生成交给后台线程
 fn ensure_thumbnail_cached(st: &mut AppState, idx: usize) -> Option<Image> {
     if let Some(img) = st.thumb_cache.get(idx).and_then(|c| c.clone()) {
@@ -836,6 +847,8 @@ fn rescan_current(app: &AppWindow, st: &mut AppState) {
     let Some(dir) = current_dir(st).map(str::to_string) else {
         return;
     };
+    // 目录切换：作废在途缩略图任务（防旧目录结果按索引落到新目录）
+    invalidate_thumbs();
     let dir_path = std::path::Path::new(&dir);
     st.dirs = workspace::scan_subdirs(dir_path)
         .iter()
@@ -862,9 +875,61 @@ fn rescan_current(app: &AppWindow, st: &mut AppState) {
     }
 }
 
+/// 刷新当前目录：重新扫描磁盘（外部新增/删除文件可见），并**保留**当前图片选中与已生成缩略图
+/// 返回可见图片数量变化（(旧, 新)）供调用方提示
+fn refresh_current(app: &AppWindow, st: &mut AppState) -> (usize, usize) {
+    let Some(dir) = current_dir(st).map(str::to_string) else {
+        return (0, 0);
+    };
+    let old_count = st.files.len();
+    let cur_path = st.image_path.clone();
+    // 保留已生成的缩略图（按路径重映射到新索引，避免全量重新生成）
+    let cache: std::collections::HashMap<String, Image> = st
+        .files
+        .iter()
+        .enumerate()
+        .filter_map(|(i, p)| {
+            st.thumb_cache
+                .get(i)
+                .and_then(|c| c.clone())
+                .map(|img| (p.clone(), img))
+        })
+        .collect();
+
+    let dir_path = std::path::Path::new(&dir);
+    st.dirs = workspace::scan_subdirs(dir_path)
+        .iter()
+        .map(|p| p.to_string_lossy().into_owned())
+        .collect();
+    st.files = workspace::scan_images(dir_path)
+        .iter()
+        .map(|p| p.to_string_lossy().into_owned())
+        .collect();
+    if st.workspace_id >= 0 && !st.files.is_empty() {
+        st.file_ids = storage::db::upsert_files_batch(st.workspace_id, &st.files);
+    } else {
+        st.file_ids.clear();
+    }
+    // 缩略图缓存按新索引恢复
+    st.thumb_cache = st
+        .files
+        .iter()
+        .map(|p| cache.get(p).cloned())
+        .collect();
+    // 保持当前图片（仍存在则维持选中；已被删除则清空选中状态，画布保留）
+    st.file_id = cur_path
+        .as_deref()
+        .and_then(|p| st.files.iter().position(|f| f == p))
+        .and_then(|i| st.file_ids.get(i).copied())
+        .unwrap_or(-1);
+    apply_sort(st);
+    invalidate_thumbs();
+    rebuild_sidebar(app, st);
+    (old_count, st.files.len())
+}
+
 /// 打开工作目录（切换工作区根）：persist + 重置导航栈 + 扫描 + 重建列表
-fn open_workspace(app: &AppWindow, st: &mut AppState, dir: &str) {
-    persist_current(st);
+fn open_workspace(app: &AppWindow, st: &mut AppState, dir: &str) {    persist_current(st);
     st.workspace_dir = Some(dir.to_string());
     st.workspace_id = storage::db::touch_workspace(dir).unwrap_or(-1);
     st.nav_stack = vec![dir.to_string()];
@@ -1117,6 +1182,14 @@ fn finish_save(app: &AppWindow, state: &Rc<RefCell<AppState>>, out: SaveOutcome)
         Ok(rgba) => {
             // 仅当当前显示仍是该文件时才动内存基底/标注层
             if st.image_path.as_deref() == Some(out.path.as_str()) {
+                // 画布基底更新为合成结果：Slint 的 current-image 是独立位图，
+                // 不同步替换的话画布仍显示旧原图（标注看起来"消失"了）
+                if st.image_width > 0 && st.image_height > 0 {
+                    let mut buffer =
+                        SharedPixelBuffer::<Rgba8Pixel>::new(st.image_width, st.image_height);
+                    buffer.make_mut_bytes().copy_from_slice(&rgba);
+                    app.set_current_image(Image::from_rgba8(buffer));
+                }
                 st.image_rgba = rgba;
                 // 剥离本次已烧录的标注段（保留保存期间用户新增的 Δ）
                 let items = st.store.items.clone();
@@ -1146,6 +1219,8 @@ fn finish_save(app: &AppWindow, state: &Rc<RefCell<AppState>>, out: SaveOutcome)
             if out.workspace_id >= 0 {
                 storage::db::set_file_status(out.workspace_id, &out.path, "done");
             }
+            // 图片内容已变：作废在途缩略图任务（防旧任务写回旧图/污染 DB），再重建列表
+            invalidate_thumbs();
             rebuild_sidebar(app, &mut st);
             app.set_status(SharedString::from(format!("已保存（覆盖原图）: {}", out.path)));
         }
@@ -1824,6 +1899,28 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         });
     }
     {
+        // 刷新当前目录（重新扫描磁盘；保留当前图选中与缩略图缓存）
+        let weak = app.as_weak();
+        let state = state.clone();
+        app.on_refresh_current(move || {
+            let (Some(app), mut st) = (weak.upgrade(), state.borrow_mut()) else {
+                return;
+            };
+            if st.nav_stack.is_empty() {
+                app.set_status(SharedString::from("尚未打开工作目录"));
+                return;
+            }
+            persist_current(&mut st);
+            let (old, new) = refresh_current(&app, &mut st);
+            let msg = if old == new {
+                format!("已刷新（{new} 张）")
+            } else {
+                format!("已刷新：{old} → {new} 张")
+            };
+            app.set_status(SharedString::from(msg));
+        });
+    }
+    {
         // 列表/网格视图切换：持久化偏好（重启保留）
         let weak = app.as_weak();
         app.on_view_changed(move || {
@@ -2327,6 +2424,74 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         });
     }
 
+    // 6.5 目录变化自动刷新：每 2s 检查当前目录修改时间（外部增删文件即刷新列表）
+    let refresh_timer = Timer::default();
+    {
+        let weak = app.as_weak();
+        let state = state.clone();
+        let last_dir = Rc::new(RefCell::new(None::<(String, u64)>));
+        refresh_timer.start(TimerMode::Repeated, Duration::from_millis(2000), move || {
+            let Some(app) = weak.upgrade() else {
+                return;
+            };
+            // 绘制/输入/浮层进行中不打扰
+            {
+                let st = state.borrow();
+                if st.nav_stack.is_empty() || !matches!(st.interaction, Interaction::None) {
+                    return;
+                }
+            }
+            if app.get_text_input_visible()
+                || app.get_rename_visible()
+                || app.get_ctx_visible()
+                || app.get_search_visible()
+            {
+                return;
+            }
+            let dir = {
+                let st = state.borrow();
+                st.nav_stack.last().cloned()
+            };
+            let Some(dir) = dir else {
+                return;
+            };
+            let mtime = std::fs::metadata(&dir)
+                .and_then(|m| m.modified())
+                .ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            let changed = {
+                let mut last = last_dir.borrow_mut();
+                match last.as_ref() {
+                    Some((d, m)) if d == &dir => {
+                        let changed = *m != mtime;
+                        if changed {
+                            *last = Some((dir.clone(), mtime));
+                        }
+                        changed
+                    }
+                    _ => {
+                        // 首次记录 / 切换目录：仅记录基线
+                        *last = Some((dir.clone(), mtime));
+                        false
+                    }
+                }
+            };
+            if !changed {
+                return;
+            }
+            let mut st = state.borrow_mut();
+            persist_current(&mut st);
+            let (old, new) = refresh_current(&app, &mut st);
+            if old != new {
+                app.set_status(SharedString::from(format!(
+                    "检测到目录变化：{old} → {new} 张"
+                )));
+            }
+        });
+    }
+
     // 7. 异步轮询（主线程）：切图解码结果应用 + 覆盖保存收尾 + 后台缩略图回填
     let load_timer = Timer::default();
     {
@@ -2392,6 +2557,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // timer 需保持存活到窗口关闭
     std::mem::drop(timer);
+    std::mem::drop(refresh_timer);
     std::mem::drop(load_timer);
     Ok(())
 }

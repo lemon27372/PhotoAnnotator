@@ -274,6 +274,8 @@ export component AppWindow inherits Window {
     callback open-recent;
     // 「打开」按钮：系统对话框选择工作目录（Windows 原生 SHBrowseForFolder）
     callback open-folder;
+    // 刷新当前目录（重新扫描磁盘：外部新增/删除图片可见；快捷键 F5）
+    callback refresh-current;
     // 排序：点击循环 名称↑ → 名称↓ → 时间↑ → 时间↓（Rust 记模式并重排当前目录）
     in-out property <string> sort-label: "名↑";
     callback sort-toggle;
@@ -468,6 +470,14 @@ export component AppWindow inherits Window {
                             label: "打开";
                             active: false;
                             clicked => { root.open-folder(); }
+                        }
+                        SideBtn {
+                            label: "刷";
+                            active: false;
+                            clicked => {
+                                root.refresh-current();
+                                canvas-fs.focus();
+                            }
                         }
                         SideBtn {
                             label: "最近";
@@ -764,6 +774,8 @@ export component AppWindow inherits Window {
                 // ←/→ 切图（文字输入时不劫持光标移动）
                 KeyBinding { enabled: !root.text-input-visible; keys: @keys(LeftArrow); activated => { root.prev-image(); } }
                 KeyBinding { enabled: !root.text-input-visible; keys: @keys(RightArrow); activated => { root.next-image(); } }
+                // F5 刷新当前目录（外部新增/删除图片）
+                KeyBinding { enabled: !root.text-input-visible; keys: @keys(F5); activated => { root.refresh-current(); } }
                 // Esc 保持可用：取消文字输入/绘制/退出极简
                 KeyBinding { keys: @keys(Escape); activated => { root.escape-pressed(); } }
 
