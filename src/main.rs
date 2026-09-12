@@ -208,9 +208,7 @@ struct AppState {
     save_pending: bool,
     /// 排序模式：0=名称升序 1=名称降序 2=时间升序 3=时间降序
     sort_mode: u8,
-    /// 过滤：状态筛选 0=全部 1=未处理 2=已标注 3=已忽略
-    filter_status: u8,
-    /// 过滤：名称关键词（空 = 不过滤；不区分大小写包含匹配）
+    /// 名称过滤通配符（空 = 不过滤；不区分大小写；支持 * 与 ?）
     filter_name: String,
     /// 当前侧边栏行映射（行号 → 目录/图片索引；排序与过滤后重建）
     rows: Vec<RowRef>,
@@ -248,7 +246,6 @@ impl AppState {
             rename_pending: None,
             save_pending: false,
             sort_mode: 0,
-            filter_status: 0,
             filter_name: String::new(),
             rows: Vec::new(),
             ctx_image: None,
@@ -256,17 +253,9 @@ impl AppState {
     }
 }
 
-/// 过滤状态显示名（过滤按钮 label）
-fn filter_label(mode: u8) -> &'static str {
-    match mode {
-        1 => "未",
-        2 => "标",
-        3 => "忽",
-        _ => "全",
-    }
-}
-
-/// 名称是否命中关键词（空关键词命中全部；不区分大小写）
+/// 名称是否命中过滤词（空过滤词命中全部；不区分大小写）
+/// - 含 `*` 或 `?`：按通配符整名匹配（`*` 任意序列、`?` 单字符）
+/// - 不含通配符：按包含匹配（沿用关键词搜索习惯）
 fn name_matches(path: &str, keyword: &str) -> bool {
     if keyword.is_empty() {
         return true;
@@ -275,27 +264,51 @@ fn name_matches(path: &str, keyword: &str) -> bool {
         .file_name()
         .map(|s| s.to_string_lossy().to_lowercase())
         .unwrap_or_default();
-    name.contains(&keyword.to_lowercase())
+    let pat = keyword.to_lowercase();
+    if pat.contains('*') || pat.contains('?') {
+        glob_match(&pat, &name)
+    } else {
+        name.contains(&pat)
+    }
 }
 
-/// 计算过滤后可见的条目索引：目录仅受名称过滤，图片受状态 + 名称过滤
-/// statuses 与 files 一一对应（0=未处理 1=已标注 2=已忽略）
-fn filter_indices(
-    dirs: &[String],
-    files: &[String],
-    statuses: &[i32],
-    filter_status: u8,
-    filter_name: &str,
-) -> (Vec<usize>, Vec<usize>) {
+/// 通配符匹配（`*` 任意序列含空、`?` 单字符）；双指针 + 回溯，文件名场景足够
+fn glob_match(pattern: &str, text: &str) -> bool {
+    let p: Vec<char> = pattern.chars().collect();
+    let t: Vec<char> = text.chars().collect();
+    let (mut pi, mut ti) = (0usize, 0usize);
+    let mut star_p: Option<usize> = None;
+    let mut star_t = 0usize;
+    while ti < t.len() {
+        if pi < p.len() && (p[pi] == '?' || p[pi] == t[ti]) {
+            pi += 1;
+            ti += 1;
+        } else if pi < p.len() && p[pi] == '*' {
+            star_p = Some(pi);
+            star_t = ti;
+            pi += 1;
+        } else if let Some(sp) = star_p {
+            // 回溯：让 * 多吞一个字符
+            pi = sp + 1;
+            star_t += 1;
+            ti = star_t;
+        } else {
+            return false;
+        }
+    }
+    while pi < p.len() && p[pi] == '*' {
+        pi += 1;
+    }
+    pi == p.len()
+}
+
+/// 计算过滤后可见的条目索引（仅按名称过滤；目录与图片同等对待）
+fn filter_indices(dirs: &[String], files: &[String], filter_name: &str) -> (Vec<usize>, Vec<usize>) {
     let vis_dirs: Vec<usize> = (0..dirs.len())
         .filter(|&i| name_matches(&dirs[i], filter_name))
         .collect();
-    let want_status = filter_status.saturating_sub(1) as i32;
     let vis_imgs: Vec<usize> = (0..files.len())
-        .filter(|&i| {
-            let status_ok = filter_status == 0 || statuses.get(i).copied().unwrap_or(0) == want_status;
-            status_ok && name_matches(&files[i], filter_name)
-        })
+        .filter(|&i| name_matches(&files[i], filter_name))
         .collect();
     (vis_dirs, vis_imgs)
 }
@@ -750,14 +763,8 @@ fn rebuild_sidebar(app: &AppWindow, st: &mut AppState) {
         st.files.iter().map(|_| 0).collect()
     };
 
-    // 2. 过滤（目录仅按名称；图片按状态 + 名称）
-    let (vis_dirs, vis_imgs) = filter_indices(
-        &st.dirs,
-        &st.files,
-        &statuses,
-        st.filter_status,
-        &st.filter_name,
-    );
+    // 2. 过滤（仅按名称）
+    let (vis_dirs, vis_imgs) = filter_indices(&st.dirs, &st.files, &st.filter_name);
 
     // 3. 组装行（目录行在前）+ 行映射表
     let mut row_map: Vec<RowRef> = Vec::with_capacity(vis_dirs.len() + vis_imgs.len());
@@ -812,8 +819,8 @@ fn rebuild_sidebar(app: &AppWindow, st: &mut AppState) {
         .collect();
     app.set_crumb_list(slint::ModelRc::from(Rc::new(slint::VecModel::from(crumbs))));
 
-    // 6. 计数信息（有过滤时显示 可见/总数）
-    let filtering = st.filter_status != 0 || !st.filter_name.is_empty();
+    // 6. 计数信息（有名称过滤时显示 可见/总数）
+    let filtering = !st.filter_name.is_empty();
     let meta = if st.dirs.is_empty() && st.files.is_empty() {
         "空".to_string()
     } else if filtering {
@@ -1408,14 +1415,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .and_then(|s| s.parse::<i32>().ok())
             .unwrap_or(0)
             .clamp(0, 1);
-        let saved_filter = storage::db::get_setting("filter_status")
-            .and_then(|s| s.parse::<u8>().ok())
-            .unwrap_or(0)
-            .min(3);
+        let saved_filter = storage::db::get_setting("filter_names")
+            .unwrap_or_default();
         state.borrow_mut().sort_mode = saved_sort;
-        state.borrow_mut().filter_status = saved_filter;
+        state.borrow_mut().filter_name = saved_filter.clone();
         app.set_sort_label(SharedString::from(sort_label(saved_sort)));
-        app.set_filter_label(SharedString::from(filter_label(saved_filter)));
+        app.set_search_active(!saved_filter.is_empty());
         app.set_view_mode(saved_view);
     }
 
@@ -1954,28 +1959,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         });
     }
     {
-        // 状态过滤循环：全部 → 未处理 → 已标注 → 已忽略（持久化偏好）
-        let weak = app.as_weak();
-        let state = state.clone();
-        app.on_filter_toggle(move || {
-            let (Some(app), mut st) = (weak.upgrade(), state.borrow_mut()) else {
-                return;
-            };
-            st.filter_status = (st.filter_status + 1) % 4;
-            app.set_filter_label(SharedString::from(filter_label(st.filter_status)));
-            storage::db::set_setting("filter_status", &st.filter_status.to_string());
-            rebuild_sidebar(&app, &mut st);
-            let msg = match st.filter_status {
-                1 => "过滤：仅未处理",
-                2 => "过滤：仅已标注",
-                3 => "过滤：仅已忽略",
-                _ => "过滤：全部",
-            };
-            app.set_status(SharedString::from(msg));
-        });
-    }
-    {
-        // 名称过滤：打开浮层（预填当前关键词）
+        // 名称过滤：打开浮层（预填当前过滤词）
         let weak = app.as_weak();
         let state = state.clone();
         app.on_search_open(move || {
@@ -1999,6 +1983,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let active = !st.filter_name.is_empty();
             app.set_search_active(active);
             app.set_search_visible(false);
+            storage::db::set_setting("filter_names", &st.filter_name);
             rebuild_sidebar(&app, &mut st);
             let msg = if active {
                 format!("名称过滤: {}", st.filter_name)
@@ -2020,6 +2005,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             app.set_search_draft(SharedString::from(""));
             app.set_search_active(false);
             app.set_search_visible(false);
+            storage::db::set_setting("filter_names", "");
             rebuild_sidebar(&app, &mut st);
             app.set_status(SharedString::from("已清除名称过滤"));
         });
@@ -2571,20 +2557,13 @@ mod tests {
         v.iter().map(|x| x.to_string()).collect()
     }
 
-    /// 状态过滤：未处理/已标注/已忽略 各自只保留对应状态
+    /// 无过滤词：目录与图片全部可见
     #[test]
-    fn filter_by_status() {
+    fn filter_without_keyword_shows_all() {
         let files = s(&["a.png", "b.png", "c.png"]);
         let dirs = s(&["sub"]);
-        let statuses = vec![0, 1, 2]; // 未处理 / 已标注 / 已忽略
-        let (d, i) = filter_indices(&dirs, &files, &statuses, 0, "");
-        assert_eq!((d.len(), i.len()), (1, 3), "全部：目录与图片都可见");
-        let (_, i) = filter_indices(&dirs, &files, &statuses, 1, "");
-        assert_eq!(i, vec![0], "仅未处理");
-        let (_, i) = filter_indices(&dirs, &files, &statuses, 2, "");
-        assert_eq!(i, vec![1], "仅已标注");
-        let (_, i) = filter_indices(&dirs, &files, &statuses, 3, "");
-        assert_eq!(i, vec![2], "仅已忽略");
+        let (d, i) = filter_indices(&dirs, &files, "");
+        assert_eq!((d.len(), i.len()), (1, 3));
     }
 
     /// 名称过滤：不区分大小写包含匹配；目录同样受名称过滤
@@ -2592,18 +2571,42 @@ mod tests {
     fn filter_by_name_case_insensitive() {
         let files = s(&["Login-Error.PNG", "home.png"]);
         let dirs = s(&["LoginShots", "other"]);
-        let statuses = vec![0, 0];
-        let (d, i) = filter_indices(&dirs, &files, &statuses, 0, "login");
+        let (d, i) = filter_indices(&dirs, &files, "login");
         assert_eq!(d.len(), 1, "目录按名称过滤");
         assert_eq!(i, vec![0], "图片按名称过滤（忽略大小写）");
     }
 
-    /// 状态 + 名称 组合过滤
+    /// 名称过滤支持通配符（整名匹配）
     #[test]
-    fn filter_status_and_name_combined() {
-        let files = s(&["login.png", "login2.png", "home.png"]);
-        let statuses = vec![1, 0, 0];
-        let (_, i) = filter_indices(&[], &files, &statuses, 2, "login");
-        assert_eq!(i, vec![0], "已标注 且 名称含 login");
+    fn filter_by_name_wildcard() {
+        let files = s(&["login.png", "login2.png", "home.jpg"]);
+        let (_, i) = filter_indices(&[], &files, "*.png");
+        assert_eq!(i, vec![0, 1], "*.png 只留 PNG");
+        let (_, i) = filter_indices(&[], &files, "login?.png");
+        assert_eq!(i, vec![1], "? 匹配单字符");
+    }
+
+    /// 通配符：* 任意序列（含空）、? 单字符
+    #[test]
+    fn glob_wildcards() {
+        assert!(glob_match("*.png", "login.png"));
+        assert!(!glob_match("*.png", "login.jpg"));
+        assert!(glob_match("登录?", "登录1"));
+        assert!(!glob_match("登录?", "登录12"));
+        assert!(glob_match("*", "anything"));
+        assert!(glob_match("a*b*c", "axxbyyc"));
+        assert!(!glob_match("a*b*c", "axxbyy"));
+        assert!(glob_match("shot-2026*.png", "shot-2026-09-11.png"));
+    }
+
+    /// name_matches：含通配符走整名匹配，不含则走包含匹配；均不区分大小写
+    #[test]
+    fn name_matches_keyword_and_wildcard() {
+        assert!(name_matches("/tmp/Login-Error.PNG", "login"), "关键词包含匹配");
+        assert!(name_matches("/tmp/Login-Error.PNG", "*.png"), "通配符匹配扩展名");
+        assert!(!name_matches("/tmp/Login-Error.PNG", "home*"), "通配符不命中");
+        assert!(name_matches("/tmp/登录1.png", "登录?.png"), "? 匹配单个字符");
+        assert!(name_matches("/tmp/登录截图1.png", "登录*"), "* 匹配任意序列");
+        assert!(name_matches("/tmp/a.png", ""), "空过滤词命中全部");
     }
 }
